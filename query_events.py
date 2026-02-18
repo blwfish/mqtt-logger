@@ -17,6 +17,10 @@ from pathlib import Path
 
 
 def get_db_path():
+    # Check for Docker volume path first, then fall back to local
+    docker_path = Path('/data/mqtt_events.db')
+    if docker_path.exists():
+        return docker_path
     return Path(__file__).parent / 'mqtt_events.db'
 
 

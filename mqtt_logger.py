@@ -11,9 +11,12 @@ import argparse
 import json
 import logging
 import logging.handlers
+import platform
 import signal
 import sqlite3
+import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +28,7 @@ logger = logging.getLogger(__name__)
 def init_database(db_path: str) -> sqlite3.Connection:
     """Initialize SQLite database with mqtt_events table."""
     conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS mqtt_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,12 +79,75 @@ def extract_sender(topic: str, payload: str) -> str | None:
     return None
 
 
+class LoopDetector:
+    """Detect MQTT message floods — topics with abnormally high publish rates.
+
+    Tracks per-topic message counts in a sliding window. When a topic exceeds
+    the threshold, logs a warning and writes to an alert file. A host-side
+    watcher (alert_watcher.sh) can tail this file and fire macOS notifications.
+    """
+
+    WINDOW_SEC = 5        # Sliding window length
+    THRESHOLD = 10        # Messages per window to trigger alert
+    COOLDOWN_SEC = 60     # Suppress repeat alerts per topic
+
+    def __init__(self, alert_file: str | None = None):
+        # topic -> list of timestamps (monotonic)
+        self._counts: dict[str, list[float]] = {}
+        # topic -> last alert time (monotonic)
+        self._last_alert: dict[str, float] = {}
+        self._alert_file = alert_file
+
+    def record(self, topic: str) -> None:
+        now = time.monotonic()
+        timestamps = self._counts.setdefault(topic, [])
+        timestamps.append(now)
+
+        # Trim old entries outside the window
+        cutoff = now - self.WINDOW_SEC
+        while timestamps and timestamps[0] < cutoff:
+            timestamps.pop(0)
+
+        if len(timestamps) >= self.THRESHOLD:
+            last = self._last_alert.get(topic, 0)
+            if now - last >= self.COOLDOWN_SEC:
+                self._last_alert[topic] = now
+                self._alert(topic, len(timestamps))
+
+    def _alert(self, topic: str, count: int) -> None:
+        msg = f"MQTT flood: {count} msgs in {self.WINDOW_SEC}s on {topic}"
+        logger.warning(msg)
+
+        # Write to alert file (tailed by host-side watcher for notifications)
+        if self._alert_file:
+            try:
+                with open(self._alert_file, 'a') as f:
+                    f.write(f"{datetime.now().isoformat()} {msg}\n")
+            except Exception:
+                pass
+
+        # Direct macOS notification when running natively (not in Docker)
+        if platform.system() == 'Darwin':
+            try:
+                subprocess.Popen([
+                    'osascript', '-e',
+                    f'display notification "{msg}" '
+                    f'with title "MQTT Loop Detected" sound name "Sosumi"'
+                ])
+            except Exception:
+                pass
+
+
 class MQTTLogger:
     def __init__(self, broker: str, port: int, db_path: str):
         self.broker = broker
         self.port = port
         self.db_conn = init_database(db_path)
         self.running = True
+
+        # Alert file lives next to the DB (on mounted volume in Docker)
+        alert_file = str(Path(db_path).parent / 'alerts.log')
+        self.loop_detector = LoopDetector(alert_file=alert_file)
 
         # Create MQTT client (paho-mqtt 2.x API)
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -91,9 +158,9 @@ class MQTTLogger:
     def on_connect(self, client, userdata, flags, reason_code, properties):
         if reason_code == 0:
             logger.info(f"Connected to broker {self.broker}:{self.port}")
-            # Subscribe to all topics
+            # Subscribe to all topics (# doesn't match $SYS by default, which is fine)
             client.subscribe('#', qos=0)
-            logger.info("Subscribed to # (all topics)")
+            logger.info("Subscribed to # (all application topics, excluding $SYS)")
         else:
             logger.error(f"Connection failed with code: {reason_code}")
 
@@ -119,6 +186,9 @@ class MQTTLogger:
                 (timestamp, msg.topic, sender, payload, msg.qos, retained)
             )
             self.db_conn.commit()
+
+            # Check for message floods
+            self.loop_detector.record(msg.topic)
 
             # Log to console (truncate long payloads)
             display_payload = payload[:100] + '...' if len(payload) > 100 else payload
@@ -159,7 +229,7 @@ def setup_logging(log_path: Path, verbose: bool):
 
     handler = logging.handlers.RotatingFileHandler(
         log_file,
-        maxBytes=5*1024*1024,  # 5MB
+        maxBytes=50*1024*1024,  # 50MB
         backupCount=3
     )
     handler.setFormatter(logging.Formatter(

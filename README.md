@@ -89,7 +89,64 @@ python query_events.py --stats
 | `--stats` | Show database statistics |
 | `--db` | Custom database path |
 
-## macOS launchd Service
+## Docker (Recommended)
+
+### Quick Start
+
+```bash
+# If broker is running on the host machine
+docker compose up -d
+
+# Check logs
+docker compose logs -f
+
+# Stop
+docker compose down
+```
+
+### Configuration
+
+Set environment variables in `.env` or pass them directly:
+
+```bash
+# .env file
+MQTT_BROKER=192.168.1.100
+MQTT_PORT=1883
+```
+
+Or override on command line:
+```bash
+MQTT_BROKER=mybroker.local docker compose up -d
+```
+
+### Data Persistence
+
+The SQLite database is stored in a Docker volume (`mqtt-data`). To access it:
+
+```bash
+# Query events from host
+docker compose exec mqtt-logger python query_events.py --stats
+docker compose exec mqtt-logger python query_events.py --topics
+docker compose exec mqtt-logger python query_events.py --since 1h
+
+# Or copy the database out
+docker compose cp mqtt-logger:/data/mqtt_events.db ./mqtt_events.db
+```
+
+### Build Only
+
+```bash
+docker build -t mqtt-logger .
+docker run -d --name mqtt-logger \
+  -e MQTT_BROKER=host.docker.internal \
+  -v mqtt-data:/data \
+  --add-host=host.docker.internal:host-gateway \
+  mqtt-logger
+```
+
+## macOS launchd Service (Alternative)
+
+If you prefer running without Docker:
 
 ### Install
 
