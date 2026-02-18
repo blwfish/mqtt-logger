@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.db
+*.log
+.DS_Store
+.git/
+.gitignore
+mosquitto/
+*.plist
+.claude/

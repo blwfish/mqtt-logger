@@ -1,0 +1,11 @@
+services:
+  mqtt-logger:
+    build: .
+    container_name: mqtt-logger
+    restart: unless-stopped
+    environment:
+      - MQTT_BROKER=192.168.68.250
+      - MQTT_PORT=1883
+      - MQTT_DB=/data/mqtt_events.db
+    volumes:
+      - ./data:/data
