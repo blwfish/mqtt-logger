@@ -1,10 +1,24 @@
 #!/usr/bin/env python3
 """
 MQTT Event Logger
-Subscribes to all topics (#) and logs events to SQLite database.
+Subscribes to all topics (#) and logs events to one or more database backends.
+
+Supports SQLite (legacy) and MariaDB/MySQL.  Both can run simultaneously
+during a migration to validate parity before cutting over.
+
+MariaDB credentials are read from the macOS Keychain (service "mariadb-mqtt",
+accounts "logger" / "root").  Never stored in config files or command-line
+arguments.
 
 Usage:
-    python mqtt_logger.py [--broker HOST] [--port PORT] [--db PATH]
+    # SQLite only (legacy)
+    python mqtt_logger.py --broker localhost
+
+    # MariaDB only
+    python mqtt_logger.py --broker localhost --mariadb
+
+    # Both simultaneously (migration / validation period)
+    python mqtt_logger.py --broker localhost --db data/mqtt_events.db --mariadb
 """
 
 import argparse
@@ -17,6 +31,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
 
@@ -25,52 +40,170 @@ import paho.mqtt.client as mqtt
 logger = logging.getLogger(__name__)
 
 
-def init_database(db_path: str) -> sqlite3.Connection:
-    """Initialize SQLite database with mqtt_events table."""
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS mqtt_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            topic TEXT NOT NULL,
-            sender TEXT,
-            payload TEXT,
-            qos INTEGER NOT NULL,
-            retained INTEGER NOT NULL
-        )
-    ''')
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON mqtt_events(timestamp)')
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_topic ON mqtt_events(topic)')
-    conn.commit()
-    logger.info(f"Database initialized: {db_path}")
-    return conn
+# ─── Database backends ────────────────────────────────────────────────────────
 
+class DatabaseBackend(ABC):
+    """Common interface for all storage backends."""
+
+    @abstractmethod
+    def insert(self, timestamp: datetime, topic: str, sender: str | None,
+               payload: str | None, qos: int, retained: int) -> None: ...
+
+    @abstractmethod
+    def close(self) -> None: ...
+
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
+
+
+class SQLiteBackend(DatabaseBackend):
+    """SQLite backend — legacy, single-file, local only."""
+
+    def __init__(self, db_path: str):
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute('PRAGMA journal_mode=WAL')
+        self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS mqtt_events (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT    NOT NULL,
+                topic     TEXT    NOT NULL,
+                sender    TEXT,
+                payload   TEXT,
+                qos       INTEGER NOT NULL,
+                retained  INTEGER NOT NULL
+            )
+        ''')
+        self._conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_timestamp ON mqtt_events(timestamp)')
+        self._conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_topic ON mqtt_events(topic)')
+        self._conn.commit()
+        logger.info(f"SQLite backend ready: {db_path}")
+
+    @property
+    def name(self) -> str:
+        return "sqlite"
+
+    def insert(self, timestamp, topic, sender, payload, qos, retained):
+        self._conn.execute(
+            'INSERT INTO mqtt_events '
+            '(timestamp, topic, sender, payload, qos, retained) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (timestamp.isoformat(), topic, sender, payload, qos, retained)
+        )
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+
+class MariaDBBackend(DatabaseBackend):
+    """MariaDB/MySQL backend — network-accessible, least-privilege account.
+
+    Credentials are fetched from the macOS Keychain at startup:
+        service = "mariadb-mqtt"
+        account = "logger"   (INSERT + SELECT only — cannot DELETE or DROP)
+
+    To store / update the password:
+        security add-generic-password -a logger -s mariadb-mqtt -w <pw> -U
+    """
+
+    # Reconnect on transient errors rather than crashing the process.
+    _RETRYABLE = {2006, 2013, 2055}   # CR_SERVER_GONE, CR_SERVER_LOST, etc.
+
+    def __init__(self, host: str = 'localhost', port: int = 3306,
+                 database: str = 'mqtt_log', user: str = 'logger'):
+        import pymysql
+        import keyring
+
+        password = keyring.get_password("mariadb-mqtt", user)
+        if not password:
+            raise RuntimeError(
+                f"No password found in Keychain for mariadb-mqtt/{user}. "
+                f"Run: security add-generic-password -a {user} "
+                f"-s mariadb-mqtt -w <password> -U"
+            )
+
+        self._connect_args = dict(
+            host=host, port=port, user=user, password=password,
+            database=database, charset='utf8mb4',
+            autocommit=True,          # each INSERT commits immediately
+        )
+        self._pymysql = pymysql
+        self._conn = self._connect()
+        logger.info(f"MariaDB backend ready: {user}@{host}:{port}/{database}")
+
+    @property
+    def name(self) -> str:
+        return "mariadb"
+
+    def _connect(self):
+        conn = self._pymysql.connect(**self._connect_args)
+        return conn
+
+    def insert(self, timestamp, topic, sender, payload, qos, retained):
+        try:
+            self._do_insert(timestamp, topic, sender, payload, qos, retained)
+        except self._pymysql.OperationalError as exc:
+            if exc.args[0] in self._RETRYABLE:
+                logger.warning(f"MariaDB connection lost ({exc.args[0]}), reconnecting...")
+                try:
+                    self._conn = self._connect()
+                    self._do_insert(timestamp, topic, sender, payload, qos, retained)
+                except Exception as retry_exc:
+                    logger.error(f"MariaDB retry failed: {retry_exc}")
+            else:
+                raise
+
+    def _do_insert(self, timestamp, topic, sender, payload, qos, retained):
+        with self._conn.cursor() as cur:
+            cur.execute(
+                'INSERT INTO mqtt_events '
+                '(timestamp, topic, sender, payload, qos, retained) '
+                'VALUES (%s, %s, %s, %s, %s, %s)',
+                (timestamp, topic, sender, payload, qos, retained)
+                # pymysql accepts datetime objects directly — no ISO formatting needed
+            )
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
+# ─── Sender extraction ────────────────────────────────────────────────────────
 
 def extract_sender(topic: str, payload: str) -> str | None:
     """
     Attempt to extract sender from topic or payload.
 
-    Strategies (customize based on your topic structure):
-    1. Parse from topic like 'cova/turnout/sender_id/state'
-    2. Parse from JSON payload if it contains sender/client_id field
-    3. Return None if sender cannot be determined
-    """
-    # Strategy 1: Try to extract from topic structure
-    # Example: cova/device_type/device_id/... -> device_id might be sender
-    parts = topic.split('/')
-    if len(parts) >= 3:
-        # This is a guess - adjust based on your actual topic structure
-        # For now, return None and let the data reveal the pattern
-        pass
+    Known topic patterns:
+    - /log/{board}                        board-config log messages
+    - {prefix}/config/status/{board}      board-config config status (retained)
+    - {prefix}/config/backup/{board}      board-config config backup (retained)
 
-    # Strategy 2: Try to parse JSON payload for sender field
+    Known payload patterns (JSON):
+    - {"board": "name", ...}              board-config config request/status
+    """
+    parts = topic.strip('/').split('/')
+
+    # /log/{board}
+    if len(parts) == 2 and parts[0] == 'log':
+        return parts[1]
+
+    # {prefix}/config/status/{board} or {prefix}/config/backup/{board}
+    if len(parts) >= 3 and parts[-2] in ('status', 'backup') and parts[-3] == 'config':
+        return parts[-1]
+
+    # JSON payload field lookup
     if payload:
         try:
             data = json.loads(payload)
             if isinstance(data, dict):
-                # Look for common sender field names
-                for key in ['sender', 'client_id', 'clientId', 'source', 'from', 'device_id']:
+                for key in ['board', 'sender', 'client_id', 'clientId',
+                            'source', 'from', 'device_id']:
                     if key in data:
                         return str(data[key])
         except (json.JSONDecodeError, TypeError):
@@ -78,6 +211,8 @@ def extract_sender(topic: str, payload: str) -> str | None:
 
     return None
 
+
+# ─── Loop / flood detection ───────────────────────────────────────────────────
 
 class LoopDetector:
     """Detect MQTT message floods — topics with abnormally high publish rates.
@@ -92,9 +227,7 @@ class LoopDetector:
     COOLDOWN_SEC = 60     # Suppress repeat alerts per topic
 
     def __init__(self, alert_file: str | None = None):
-        # topic -> list of timestamps (monotonic)
         self._counts: dict[str, list[float]] = {}
-        # topic -> last alert time (monotonic)
         self._last_alert: dict[str, float] = {}
         self._alert_file = alert_file
 
@@ -103,7 +236,6 @@ class LoopDetector:
         timestamps = self._counts.setdefault(topic, [])
         timestamps.append(now)
 
-        # Trim old entries outside the window
         cutoff = now - self.WINDOW_SEC
         while timestamps and timestamps[0] < cutoff:
             timestamps.pop(0)
@@ -118,7 +250,6 @@ class LoopDetector:
         msg = f"MQTT flood: {count} msgs in {self.WINDOW_SEC}s on {topic}"
         logger.warning(msg)
 
-        # Write to alert file (tailed by host-side watcher for notifications)
         if self._alert_file:
             try:
                 with open(self._alert_file, 'a') as f:
@@ -126,7 +257,6 @@ class LoopDetector:
             except Exception:
                 pass
 
-        # Direct macOS notification when running natively (not in Docker)
         if platform.system() == 'Darwin':
             try:
                 subprocess.Popen([
@@ -138,18 +268,18 @@ class LoopDetector:
                 pass
 
 
+# ─── MQTT logger ──────────────────────────────────────────────────────────────
+
 class MQTTLogger:
-    def __init__(self, broker: str, port: int, db_path: str):
+    def __init__(self, broker: str, port: int,
+                 backends: list[DatabaseBackend],
+                 alert_file: str | None = None):
         self.broker = broker
         self.port = port
-        self.db_conn = init_database(db_path)
+        self.backends = backends
         self.running = True
-
-        # Alert file lives next to the DB (on mounted volume in Docker)
-        alert_file = str(Path(db_path).parent / 'alerts.log')
         self.loop_detector = LoopDetector(alert_file=alert_file)
 
-        # Create MQTT client (paho-mqtt 2.x API)
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
@@ -158,7 +288,6 @@ class MQTTLogger:
     def on_connect(self, client, userdata, flags, reason_code, properties):
         if reason_code == 0:
             logger.info(f"Connected to broker {self.broker}:{self.port}")
-            # Subscribe to all topics (# doesn't match $SYS by default, which is fine)
             client.subscribe('#', qos=0)
             logger.info("Subscribed to # (all application topics, excluding $SYS)")
         else:
@@ -170,27 +299,24 @@ class MQTTLogger:
 
     def on_message(self, client, userdata, msg):
         try:
-            # Decode payload (handle binary data gracefully)
             try:
                 payload = msg.payload.decode('utf-8')
             except UnicodeDecodeError:
-                payload = msg.payload.hex()  # Store as hex if not UTF-8
+                payload = msg.payload.hex()
 
-            timestamp = datetime.now().isoformat()
-            sender = extract_sender(msg.topic, payload)
-            retained = 1 if msg.retain else 0
+            timestamp = datetime.now()
+            sender    = extract_sender(msg.topic, payload)
+            retained  = 1 if msg.retain else 0
 
-            # Insert into database
-            self.db_conn.execute(
-                'INSERT INTO mqtt_events (timestamp, topic, sender, payload, qos, retained) VALUES (?, ?, ?, ?, ?, ?)',
-                (timestamp, msg.topic, sender, payload, msg.qos, retained)
-            )
-            self.db_conn.commit()
+            for backend in self.backends:
+                try:
+                    backend.insert(timestamp, msg.topic, sender,
+                                   payload, msg.qos, retained)
+                except Exception as exc:
+                    logger.error(f"[{backend.name}] insert failed: {exc}")
 
-            # Check for message floods
             self.loop_detector.record(msg.topic)
 
-            # Log to console (truncate long payloads)
             display_payload = payload[:100] + '...' if len(payload) > 100 else payload
             logger.debug(f"[{msg.topic}] {display_payload}")
 
@@ -198,9 +324,9 @@ class MQTTLogger:
             logger.error(f"Error processing message: {e}")
 
     def run(self):
-        """Main run loop with reconnection logic."""
         logger.info(f"Connecting to MQTT broker at {self.broker}:{self.port}")
-
+        backend_names = ', '.join(b.name for b in self.backends)
+        logger.info(f"Active backends: {backend_names}")
         try:
             self.client.connect(self.broker, self.port, keepalive=60)
             self.client.loop_forever()
@@ -212,35 +338,33 @@ class MQTTLogger:
             self.cleanup()
 
     def cleanup(self):
-        """Clean shutdown."""
         self.client.disconnect()
-        self.db_conn.close()
+        for backend in self.backends:
+            backend.close()
         logger.info("MQTT Logger stopped")
 
     def stop(self):
-        """Signal handler for graceful shutdown."""
         self.running = False
         self.client.disconnect()
 
 
-def setup_logging(log_path: Path, verbose: bool):
-    """Configure logging to file in script directory."""
-    log_file = log_path / 'mqtt_logger.log'
+# ─── Logging setup ────────────────────────────────────────────────────────────
 
+def setup_logging(log_path: Path, verbose: bool):
+    log_file = log_path / 'mqtt_logger.log'
     handler = logging.handlers.RotatingFileHandler(
-        log_file,
-        maxBytes=50*1024*1024,  # 50MB
-        backupCount=3
+        log_file, maxBytes=50 * 1024 * 1024, backupCount=3
     )
     handler.setFormatter(logging.Formatter(
         '%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     ))
-
     root_logger = logging.getLogger()
     root_logger.addHandler(handler)
     root_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
 
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description='MQTT Event Logger')
@@ -248,27 +372,64 @@ def main():
                         help='MQTT broker hostname (default: localhost)')
     parser.add_argument('--port', '-p', type=int, default=1883,
                         help='MQTT broker port (default: 1883)')
-    parser.add_argument('--db', '-d', default='mqtt_events.db',
-                        help='SQLite database path (default: mqtt_events.db)')
+
+    # SQLite options
+    parser.add_argument('--db', '-d', default=None,
+                        help='SQLite database path. Omit to disable SQLite backend.')
+
+    # MariaDB options
+    parser.add_argument('--mariadb', action='store_true',
+                        help='Enable MariaDB backend (credentials from Keychain)')
+    parser.add_argument('--mariadb-host', default='localhost',
+                        help='MariaDB host (default: localhost)')
+    parser.add_argument('--mariadb-port', type=int, default=3306,
+                        help='MariaDB port (default: 3306)')
+    parser.add_argument('--mariadb-db', default='mqtt_log',
+                        help='MariaDB database name (default: mqtt_log)')
+
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose logging')
 
     args = parser.parse_args()
 
-    # Resolve paths relative to script location
     script_dir = Path(__file__).parent
-
-    db_path = Path(args.db)
-    if not db_path.is_absolute():
-        db_path = script_dir / db_path
-
     setup_logging(script_dir, args.verbose)
 
-    mqtt_logger = MQTTLogger(args.broker, args.port, str(db_path))
+    # Build backend list — at least one must be enabled
+    backends: list[DatabaseBackend] = []
 
-    # Handle signals for graceful shutdown
+    if args.db:
+        db_path = Path(args.db)
+        if not db_path.is_absolute():
+            db_path = script_dir / db_path
+        backends.append(SQLiteBackend(str(db_path)))
+
+    if args.mariadb:
+        backends.append(MariaDBBackend(
+            host=args.mariadb_host,
+            port=args.mariadb_port,
+            database=args.mariadb_db,
+        ))
+
+    if not backends:
+        # Default to SQLite for backwards compatibility
+        db_path = script_dir / 'mqtt_events.db'
+        logger.warning(f"No backend specified — defaulting to SQLite: {db_path}")
+        backends.append(SQLiteBackend(str(db_path)))
+
+    # Alert file next to SQLite DB (or script dir if MariaDB-only)
+    sqlite_backends = [b for b in backends if isinstance(b, SQLiteBackend)]
+    if sqlite_backends:
+        alert_file = str(Path(sqlite_backends[0]._conn.execute(
+            "PRAGMA database_list").fetchone()[2]).parent / 'alerts.log')
+    else:
+        alert_file = str(script_dir / 'alerts.log')
+
+    mqtt_logger = MQTTLogger(args.broker, args.port, backends,
+                             alert_file=alert_file)
+
     signal.signal(signal.SIGTERM, lambda s, f: mqtt_logger.stop())
-    signal.signal(signal.SIGINT, lambda s, f: mqtt_logger.stop())
+    signal.signal(signal.SIGINT,  lambda s, f: mqtt_logger.stop())
 
     mqtt_logger.run()
 
