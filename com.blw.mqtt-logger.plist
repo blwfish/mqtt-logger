@@ -11,6 +11,7 @@
         <string>/Volumes/Files/claude/mqtt-logger/mqtt_logger.py</string>
         <string>--broker</string>
         <string>localhost</string>
+        <string>--mariadb</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -27,5 +28,11 @@
 
     <key>ThrottleInterval</key>
     <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/blw/Library/Logs/mqtt-logger/stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/blw/Library/Logs/mqtt-logger/stderr.log</string>
 </dict>
 </plist>
