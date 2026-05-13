@@ -6,6 +6,13 @@ services:
     environment:
       - MQTT_BROKER=192.168.68.250
       - MQTT_PORT=1883
+      # SQLite (default). Leave MQTT_DB unset to disable SQLite.
       - MQTT_DB=/data/mqtt_events.db
+      # MariaDB (off by default). Set MQTT_MARIADB=1 to enable.
+      # Credentials come from the container's keyring backend at startup.
+      # - MQTT_MARIADB=1
+      # - MQTT_MARIADB_HOST=host.docker.internal
+      # - MQTT_MARIADB_PORT=3306
+      # - MQTT_MARIADB_DB=mqtt_log
     volumes:
       - ./data:/data

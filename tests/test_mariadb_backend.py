@@ -11,7 +11,11 @@ def make_backend(fake_pymysql, fake_keyring, monkeypatch, password="secret"):
     fake_keyring._password = password
     fake_conn = MagicMock(name="conn")
     fake_pymysql.connect = MagicMock(return_value=fake_conn)
-    return MariaDBBackend(host="h", port=3306, database="db", user="u"), fake_conn
+    backend = MariaDBBackend(host="h", port=3306, database="db", user="u")
+    # Construction runs `CREATE TABLE IF NOT EXISTS` via the cursor — clear
+    # the mock so per-test assertions only see the calls each test makes.
+    fake_conn.cursor.return_value.__enter__.return_value.execute.reset_mock()
+    return backend, fake_conn
 
 
 class TestStartup:
@@ -37,6 +41,56 @@ class TestStartup:
         assert kwargs["host"] == "h"
         assert kwargs["password"] == "secret"
         assert kwargs["autocommit"] is True
+
+
+class TestSchemaParity:
+    """MariaDBBackend should run a CREATE TABLE IF NOT EXISTS on init, the
+    same way SQLiteBackend does. Production accounts that lack the CREATE
+    privilege get the DDL error silently swallowed."""
+
+    def test_init_runs_ddl(self, fake_pymysql, fake_keyring, monkeypatch):
+        from mqtt_logger import MariaDBBackend
+        fake_keyring._password = "secret"
+        fake_conn = MagicMock(name="conn")
+        fake_pymysql.connect = MagicMock(return_value=fake_conn)
+
+        MariaDBBackend(host="h", database="db", user="u")
+        cursor = fake_conn.cursor.return_value.__enter__.return_value
+
+        # At least one statement, and one of them is CREATE TABLE.
+        executed = [c.args[0] for c in cursor.execute.call_args_list]
+        assert any("CREATE TABLE" in s.upper() for s in executed)
+        assert any("mqtt_events" in s for s in executed)
+
+    def test_ddl_permission_denied_is_swallowed(self, fake_pymysql,
+                                                fake_keyring, monkeypatch):
+        """Regression: the `logger` account is INSERT+SELECT only. CREATE
+        must not crash startup."""
+        from mqtt_logger import MariaDBBackend
+        fake_keyring._password = "secret"
+        fake_conn = MagicMock(name="conn")
+        cursor = fake_conn.cursor.return_value.__enter__.return_value
+        cursor.execute.side_effect = fake_pymysql.OperationalError(
+            1142, "CREATE command denied"
+        )
+        fake_pymysql.connect = MagicMock(return_value=fake_conn)
+
+        # Should NOT raise.
+        MariaDBBackend(host="h", database="db", user="u")
+
+    def test_ddl_other_operational_error_propagates(self, fake_pymysql,
+                                                    fake_keyring, monkeypatch):
+        from mqtt_logger import MariaDBBackend
+        fake_keyring._password = "secret"
+        fake_conn = MagicMock(name="conn")
+        cursor = fake_conn.cursor.return_value.__enter__.return_value
+        cursor.execute.side_effect = fake_pymysql.OperationalError(
+            1064, "syntax error"
+        )
+        fake_pymysql.connect = MagicMock(return_value=fake_conn)
+
+        with pytest.raises(fake_pymysql.OperationalError):
+            MariaDBBackend(host="h", database="db", user="u")
 
 
 class TestInsert:

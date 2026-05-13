@@ -1,9 +1,9 @@
 """Unit tests for query_events — wildcard semantics, parsing, output."""
-import sqlite3
 from datetime import datetime, timedelta
 
 import pytest
 
+from mqtt_logger import SQLiteBackend, SQLiteQueryBackend
 from query_events import (
     list_topics,
     mqtt_pattern_to_regex,
@@ -14,34 +14,26 @@ from query_events import (
 
 
 @pytest.fixture
-def seeded_conn():
-    conn = sqlite3.connect(":memory:")
-    conn.execute('''
-        CREATE TABLE mqtt_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            topic TEXT NOT NULL,
-            sender TEXT,
-            payload TEXT,
-            qos INTEGER NOT NULL,
-            retained INTEGER NOT NULL
-        )
-    ''')
+def seeded_backend(tmp_path):
+    """Build a SQLite event store via the real writer, then hand back a
+    read-side backend pointed at the same file. Verifies that the writer
+    and reader stay schema-compatible."""
+    db_path = tmp_path / "events.db"
+    writer = SQLiteBackend(str(db_path))
     now = datetime(2026, 5, 12, 10, 0, 0)
     rows = [
-        (now.isoformat(), "cova/foo/status", None, "1", 0, 0),
-        (now.isoformat(), "cova/bar/status", None, "2", 0, 0),
-        (now.isoformat(), "cova/foo/bar/status", None, "3", 0, 0),
-        (now.isoformat(), "log/board1", "board1", "4", 1, 1),
-        (now.isoformat(), "other/topic", None, "5", 0, 0),
+        ("cova/foo/status", None, "1", 0, 0),
+        ("cova/bar/status", None, "2", 0, 0),
+        ("cova/foo/bar/status", None, "3", 0, 0),
+        ("log/board1", "board1", "4", 1, 1),
+        ("other/topic", None, "5", 0, 0),
     ]
-    conn.executemany(
-        "INSERT INTO mqtt_events (timestamp, topic, sender, payload, qos, "
-        "retained) VALUES (?, ?, ?, ?, ?, ?)",
-        rows,
-    )
-    conn.commit()
-    return conn
+    for topic, sender, payload, qos, retained in rows:
+        writer.insert(now, topic, sender, payload, qos, retained)
+    writer.close()
+    backend = SQLiteQueryBackend(str(db_path))
+    yield backend
+    backend.close()
 
 
 class TestParseDuration:
@@ -100,43 +92,43 @@ class TestMqttPatternToRegex:
 
 
 class TestQueryEvents:
-    def test_no_filter_returns_recent(self, seeded_conn, capsys):
-        query_events(seeded_conn)
+    def test_no_filter_returns_recent(self, seeded_backend, capsys):
+        query_events(seeded_backend)
         out = capsys.readouterr().out
         # All 5 seeded topics should appear.
         assert "cova/foo/status" in out
         assert "log/board1" in out
 
-    def test_single_level_filter_excludes_deeper(self, seeded_conn, capsys):
-        query_events(seeded_conn, topic_pattern="cova/+/status")
+    def test_single_level_filter_excludes_deeper(self, seeded_backend, capsys):
+        query_events(seeded_backend, topic_pattern="cova/+/status")
         out = capsys.readouterr().out
         assert "cova/foo/status" in out
         assert "cova/bar/status" in out
         assert "cova/foo/bar/status" not in out  # regression assertion
 
-    def test_multi_level_filter(self, seeded_conn, capsys):
-        query_events(seeded_conn, topic_pattern="cova/#")
+    def test_multi_level_filter(self, seeded_backend, capsys):
+        query_events(seeded_backend, topic_pattern="cova/#")
         out = capsys.readouterr().out
         assert "cova/foo/status" in out
         assert "cova/foo/bar/status" in out
         assert "log/board1" not in out
 
-    def test_literal_filter(self, seeded_conn, capsys):
-        query_events(seeded_conn, topic_pattern="log/board1")
+    def test_literal_filter(self, seeded_backend, capsys):
+        query_events(seeded_backend, topic_pattern="log/board1")
         out = capsys.readouterr().out
         assert "log/board1" in out
         assert "cova/" not in out
 
-    def test_limit_applies(self, seeded_conn, capsys):
-        query_events(seeded_conn, limit=2)
+    def test_limit_applies(self, seeded_backend, capsys):
+        query_events(seeded_backend, limit=2)
         out = capsys.readouterr().out
         lines = [l for l in out.splitlines() if l.startswith("2026")]
         assert len(lines) == 2
 
 
 class TestStats:
-    def test_show_stats(self, seeded_conn, capsys):
-        show_stats(seeded_conn)
+    def test_show_stats(self, seeded_backend, capsys):
+        show_stats(seeded_backend)
         out = capsys.readouterr().out
         assert "Total events:" in out
         assert "5" in out
@@ -144,8 +136,8 @@ class TestStats:
 
 
 class TestListTopics:
-    def test_list_topics(self, seeded_conn, capsys):
-        list_topics(seeded_conn)
+    def test_list_topics(self, seeded_backend, capsys):
+        list_topics(seeded_backend)
         out = capsys.readouterr().out
         assert "cova/foo/status" in out
         assert "log/board1" in out

@@ -1,184 +1,153 @@
 #!/usr/bin/env python3
 """
-Query utility for MQTT events database.
+Query utility for MQTT events.
 
-Usage:
-    python query_events.py                    # Show recent events
-    python query_events.py --topics           # List unique topics
-    python query_events.py --topic cova/#     # Filter by topic pattern
-    python query_events.py --since 1h         # Events from last hour
-    python query_events.py --stats            # Show statistics
+Selects a backend exactly the way mqtt_logger.py does:
+    --db PATH    → SQLite
+    --mariadb    → MariaDB (credentials from Keychain)
+    neither      → auto-detect SQLite at /data/mqtt_events.db
+                   (Docker volume) or ./mqtt_events.db (local).
+
+Examples:
+    python query_events.py                       # recent events from SQLite
+    python query_events.py --mariadb             # recent events from MariaDB
+    python query_events.py --topics              # list unique topics
+    python query_events.py --topic 'cova/+/status'   # MQTT wildcard filter
+    python query_events.py --since 1h --limit 100
+    python query_events.py --stats
 """
 
 import argparse
-import re
-import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from mqtt_logger import (
+    MariaDBQueryBackend,
+    QueryBackend,
+    SQLiteQueryBackend,
+)
 
-def mqtt_pattern_to_regex(pattern: str) -> str:
-    """Translate an MQTT topic filter to an anchored regular expression.
-
-    MQTT semantics: `+` matches exactly one level (no `/`), `#` matches one or
-    more levels and is only legal as the final segment. Translating both to
-    SQL `%` (as the previous implementation did) is wrong because `%` crosses
-    `/` boundaries — `cova/+/foo` would have matched `cova/a/b/foo`.
-    """
-    segments = pattern.split('/')
-    parts = []
-    for i, seg in enumerate(segments):
-        if seg == '+':
-            parts.append(r'[^/]+')
-        elif seg == '#':
-            if i != len(segments) - 1:
-                raise ValueError(
-                    f"'#' is only allowed as the final segment of an MQTT filter "
-                    f"(got: {pattern!r})"
-                )
-            parts.append(r'.+')
-        else:
-            parts.append(re.escape(seg))
-    return '^' + '/'.join(parts) + '$'
-
-
-def get_db_path():
-    # Check for Docker volume path first, then fall back to local
-    docker_path = Path('/data/mqtt_events.db')
-    if docker_path.exists():
-        return docker_path
-    return Path(__file__).parent / 'mqtt_events.db'
+# Re-export the regex helper so existing tests (and any external callers)
+# don't break.
+from mqtt_logger import _mqtt_pattern_to_regex as mqtt_pattern_to_regex  # noqa: F401
 
 
 def parse_duration(duration_str: str) -> timedelta:
     """Parse duration like '1h', '30m', '7d' into timedelta."""
     unit = duration_str[-1].lower()
     value = int(duration_str[:-1])
-
     if unit == 'm':
         return timedelta(minutes=value)
-    elif unit == 'h':
+    if unit == 'h':
         return timedelta(hours=value)
-    elif unit == 'd':
+    if unit == 'd':
         return timedelta(days=value)
-    else:
-        raise ValueError(f"Unknown duration unit: {unit}")
+    raise ValueError(f"Unknown duration unit: {unit}")
 
 
-def list_topics(conn: sqlite3.Connection):
-    """List all unique topics with message counts."""
-    cursor = conn.execute('''
-        SELECT topic, COUNT(*) as count
-        FROM mqtt_events
-        GROUP BY topic
-        ORDER BY count DESC
-    ''')
-
+def list_topics(backend: QueryBackend) -> None:
     print(f"{'Topic':<60} {'Count':>8}")
     print("-" * 70)
-    for row in cursor:
-        print(f"{row[0]:<60} {row[1]:>8}")
+    for topic, count in backend.list_topics():
+        print(f"{topic:<60} {count:>8}")
 
 
-def show_stats(conn: sqlite3.Connection):
-    """Show database statistics."""
-    stats = {}
-
-    stats['total_events'] = conn.execute('SELECT COUNT(*) FROM mqtt_events').fetchone()[0]
-    stats['unique_topics'] = conn.execute('SELECT COUNT(DISTINCT topic) FROM mqtt_events').fetchone()[0]
-    stats['retained_count'] = conn.execute('SELECT COUNT(*) FROM mqtt_events WHERE retained=1').fetchone()[0]
-
-    first = conn.execute('SELECT MIN(timestamp) FROM mqtt_events').fetchone()[0]
-    last = conn.execute('SELECT MAX(timestamp) FROM mqtt_events').fetchone()[0]
-
+def show_stats(backend: QueryBackend) -> None:
+    s = backend.stats()
     print("MQTT Events Database Statistics")
     print("=" * 40)
-    print(f"Total events:    {stats['total_events']:,}")
-    print(f"Unique topics:   {stats['unique_topics']:,}")
-    print(f"Retained msgs:   {stats['retained_count']:,}")
-    print(f"First event:     {first or 'N/A'}")
-    print(f"Last event:      {last or 'N/A'}")
+    print(f"Total events:    {s['total_events']:,}")
+    print(f"Unique topics:   {s['unique_topics']:,}")
+    print(f"Retained msgs:   {s['retained_count']:,}")
+    print(f"First event:     {s['first_event'] or 'N/A'}")
+    print(f"Last event:      {s['last_event'] or 'N/A'}")
 
 
-def query_events(conn: sqlite3.Connection, topic_pattern: str = None,
-                 since: str = None, limit: int = 50):
-    """Query and display events."""
-    query = 'SELECT timestamp, topic, sender, payload, qos, retained FROM mqtt_events WHERE 1=1'
-    params = []
-
-    if topic_pattern:
-        if '+' in topic_pattern or '#' in topic_pattern:
-            # Register a UDF that respects MQTT level boundaries. Done inline
-            # because the helper has no state and the connection is short-lived.
-            regex = mqtt_pattern_to_regex(topic_pattern)
-            compiled = re.compile(regex)
-            conn.create_function(
-                'mqtt_match', 1, lambda t: bool(compiled.match(t or ''))
-            )
-            query += ' AND mqtt_match(topic)'
-        else:
-            query += ' AND topic = ?'
-            params.append(topic_pattern)
-
+def query_events(backend: QueryBackend, topic_pattern: str | None = None,
+                 since: str | None = None, limit: int = 50) -> None:
+    cutoff = None
     if since:
         try:
-            delta = parse_duration(since)
-            cutoff = (datetime.now() - delta).isoformat()
-            query += ' AND timestamp >= ?'
-            params.append(cutoff)
+            cutoff = datetime.now() - parse_duration(since)
         except ValueError as e:
             print(f"Invalid duration: {e}")
             return
 
-    query += ' ORDER BY timestamp DESC LIMIT ?'
-    params.append(limit)
-
-    cursor = conn.execute(query, params)
-
-    for row in cursor:
+    for row in backend.query_events(topic_pattern, cutoff, limit):
         timestamp, topic, sender, payload, qos, retained = row
-
-        # Truncate payload for display
-        display_payload = payload[:80] + '...' if payload and len(payload) > 80 else payload
-
+        display_payload = (payload[:80] + '...'
+                           if payload and len(payload) > 80 else payload)
         ret_flag = 'R' if retained else ' '
         sender_str = f" [{sender}]" if sender else ""
-
         print(f"{timestamp} Q{qos}{ret_flag} {topic}{sender_str}")
         if display_payload:
             print(f"    {display_payload}")
         print()
 
 
+def default_sqlite_path() -> Path:
+    """Check for Docker volume path first, then fall back to local file."""
+    docker_path = Path('/data/mqtt_events.db')
+    if docker_path.exists():
+        return docker_path
+    return Path(__file__).parent / 'mqtt_events.db'
+
+
+def build_backend(args) -> QueryBackend:
+    if args.mariadb:
+        return MariaDBQueryBackend(
+            host=args.mariadb_host,
+            port=args.mariadb_port,
+            database=args.mariadb_db,
+        )
+
+    db_path = Path(args.db) if args.db else default_sqlite_path()
+    if not db_path.exists():
+        raise SystemExit(
+            f"SQLite database not found: {db_path}\n"
+            "Run mqtt_logger.py first, or pass --mariadb."
+        )
+    return SQLiteQueryBackend(str(db_path))
+
+
 def main():
     parser = argparse.ArgumentParser(description='Query MQTT events database')
-    parser.add_argument('--db', default=None, help='Database path')
-    parser.add_argument('--topics', action='store_true', help='List unique topics')
-    parser.add_argument('--topic', '-t', help='Filter by topic pattern (supports # and +)')
-    parser.add_argument('--since', '-s', help='Show events since duration (e.g., 1h, 30m, 7d)')
-    parser.add_argument('--limit', '-n', type=int, default=50, help='Max events to show')
-    parser.add_argument('--stats', action='store_true', help='Show statistics')
+
+    parser.add_argument('--db', default=None,
+                        help='SQLite database path')
+
+    parser.add_argument('--mariadb', action='store_true',
+                        help='Query MariaDB instead of SQLite '
+                             '(credentials from Keychain)')
+    parser.add_argument('--mariadb-host', default='localhost',
+                        help='MariaDB host (default: localhost)')
+    parser.add_argument('--mariadb-port', type=int, default=3306,
+                        help='MariaDB port (default: 3306)')
+    parser.add_argument('--mariadb-db', default='mqtt_log',
+                        help='MariaDB database name (default: mqtt_log)')
+
+    parser.add_argument('--topics', action='store_true',
+                        help='List unique topics with message counts')
+    parser.add_argument('--topic', '-t',
+                        help='Filter by MQTT topic pattern (supports # and +)')
+    parser.add_argument('--since', '-s',
+                        help='Show events since duration (e.g., 1h, 30m, 7d)')
+    parser.add_argument('--limit', '-n', type=int, default=50,
+                        help='Max events to show')
+    parser.add_argument('--stats', action='store_true',
+                        help='Show database statistics')
 
     args = parser.parse_args()
-
-    db_path = Path(args.db) if args.db else get_db_path()
-
-    if not db_path.exists():
-        print(f"Database not found: {db_path}")
-        print("Run mqtt_logger.py first to create the database.")
-        return
-
-    conn = sqlite3.connect(str(db_path))
-
+    backend = build_backend(args)
     try:
         if args.topics:
-            list_topics(conn)
+            list_topics(backend)
         elif args.stats:
-            show_stats(conn)
+            show_stats(backend)
         else:
-            query_events(conn, args.topic, args.since, args.limit)
+            query_events(backend, args.topic, args.since, args.limit)
     finally:
-        conn.close()
+        backend.close()
 
 
 if __name__ == '__main__':

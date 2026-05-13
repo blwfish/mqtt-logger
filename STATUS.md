@@ -1,92 +1,129 @@
-# MQTT Logger - Project Status
+# MQTT Logger — Project Status
 
 ## Overview
 
-| Item | Status |
-|------|--------|
-| **Project** | MQTT Event Logger |
-| **Version** | 1.0.0 |
-| **Status** | Operational |
-| **Platform** | macOS (launchd service) |
+| Item        | Status                                             |
+|-------------|----------------------------------------------------|
+| Project     | MQTT Event Logger                                  |
+| Version     | 1.1.0                                              |
+| Status      | Operational (MariaDB backend live)                 |
+| Platform    | macOS (launchd) + Docker                           |
+
+## Backends
+
+Two parallel storage backends. Both are first-class — every code path that
+exists for one exists for the other, with differences limited to dialect
+(SQL placeholders, regex operators) and credentials.
+
+| Backend  | Use case                              | Current host       |
+|----------|---------------------------------------|--------------------|
+| SQLite   | Embedded / foreign deployments        | Available, dormant |
+| MariaDB  | Central logging host                  | **Active**         |
+
+The live launchd plist runs `--mariadb` only. SQLite is enabled by adding
+`--db <path>` and is the default when no backend flag is passed.
 
 ## Components
 
-| Component | File | Status | Description |
-|-----------|------|--------|-------------|
-| Logger | `mqtt_logger.py` | Complete | MQTT listener with SQLite storage |
-| Query Tool | `query_events.py` | Complete | CLI for querying events |
-| Service | `com.blw.mqtt-logger.plist` | Complete | macOS launchd configuration |
-| Database | `mqtt_events.db` | Active | SQLite event storage |
+| Component           | File                              | Status   |
+|---------------------|-----------------------------------|----------|
+| Listener / writer   | `mqtt_logger.py`                  | Complete |
+| Query CLI           | `query_events.py`                 | Complete |
+| Flood-alert tailer  | `alert_watcher.sh`                | Complete |
+| launchd (logger)    | `com.blw.mqtt-logger.plist`       | Complete |
+| launchd (watcher)   | `com.blw.mqtt-alert-watcher.plist`| Complete |
+| Docker              | `Dockerfile` + `entrypoint.sh`    | Complete |
+| Unit tests          | `tests/`                          | 76 tests |
 
 ## Features
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Subscribe to all topics (#) | Done | Captures all MQTT traffic |
-| SQLite persistence | Done | Indexed on timestamp and topic |
-| Sender extraction | Done | Extracts from JSON payload fields |
-| Binary payload handling | Done | Stores as hex string |
-| Topic filtering | Done | Supports # and + wildcards |
-| Time-based queries | Done | Supports m/h/d duration format |
-| Statistics display | Done | Total events, topics, date range |
-| Rotating logs | Done | 5MB max, 3 backups |
-| launchd service | Done | Auto-start, auto-restart |
-| Graceful shutdown | Done | SIGTERM/SIGINT handling |
+| Feature                                             | Status |
+|-----------------------------------------------------|--------|
+| Subscribe to `#`                                    | Done   |
+| SQLite persistence + auto-schema                    | Done   |
+| MariaDB persistence + best-effort auto-schema       | Done   |
+| Dual-write (SQLite + MariaDB simultaneously)        | Done   |
+| Query CLI against both backends                     | Done   |
+| MQTT-aware wildcards in queries (`+` / `#`)         | Done   |
+| Sender extraction (topic patterns + JSON keys)      | Done   |
+| Binary payload handling (hex)                       | Done   |
+| Time-window query filter                            | Done   |
+| Per-topic flood detector with cooldown + eviction   | Done   |
+| Batched SQLite commits (25 rows / 1 s)              | Done   |
+| MariaDB reconnect on transient errors               | Done   |
+| AppleScript-safe macOS notifications                | Done   |
+| Rotating application log                            | Done   |
+| Graceful shutdown (SIGTERM / SIGINT)                | Done   |
 
 ## Dependencies
 
-| Package | Version | Purpose |
-|---------|---------|---------|
-| Python | 3.10+ | Runtime |
-| paho-mqtt | 2.x | MQTT client |
-| sqlite3 | built-in | Database |
+| Package     | Version     | Required for          |
+|-------------|-------------|-----------------------|
+| Python      | 3.10+       | Runtime               |
+| paho-mqtt   | 2.x         | All deployments       |
+| PyMySQL     | 1.1.x       | MariaDB backend       |
+| keyring     | 25.x        | MariaDB backend       |
+| sqlite3     | (stdlib)    | SQLite backend        |
 
 ## Configuration
 
-| Setting | Value | Location |
-|---------|-------|----------|
-| Default broker | localhost:1883 | CLI args |
-| Database path | mqtt_events.db | CLI args |
-| Log rotation | 5MB / 3 backups | mqtt_logger.py:160 |
-| Service throttle | 10 seconds | plist |
+| Setting                  | Value / Location                       |
+|--------------------------|----------------------------------------|
+| Broker                   | `--broker` (default `localhost`)       |
+| SQLite path              | `--db` (default `./mqtt_events.db`)    |
+| MariaDB host/port/db     | `--mariadb-host` / `-port` / `-db`     |
+| MariaDB credentials      | macOS Keychain (`mariadb-mqtt` service)|
+| Alert file               | `./data/alerts.log` (fixed)            |
+| Log rotation             | 50 MB × 3 backups                      |
+| Flood threshold          | 10 msgs / 5 s window, 60 s cooldown    |
+| SQLite commit batch      | 25 rows or 1 s, whichever first        |
 
 ## Known Limitations
 
-- Single-threaded database writes (adequate for typical MQTT traffic)
-- No authentication support (add `client.username_pw_set()` if needed)
-- No TLS support (add `client.tls_set()` if needed)
-- Sender extraction requires JSON payloads with known field names
-
-## Future Enhancements
-
-- [ ] MQTT authentication support
-- [ ] TLS/SSL connections
-- [ ] Web UI for browsing events
-- [ ] Export to CSV/JSON
-- [ ] Configurable topic filters (not just #)
-- [ ] Message payload search
-- [ ] Retention policy / auto-cleanup
+- Sender extraction only works for JSON payloads with known field names.
+- No MQTT auth / TLS — trust boundary is the LAN.
+- Single-threaded callback (paho `loop_forever`); high-volume floods are
+  serialised through the same thread that writes them.
+- Query CLI fetches results into memory; no streaming for very large
+  result sets.
 
 ## File Structure
 
 ```
 mqtt-logger/
-├── mqtt_logger.py          # Main application
-├── query_events.py         # Query utility
-├── mqtt_events.db          # SQLite database
-├── mqtt_logger.log         # Application log
-├── com.blw.mqtt-logger.plist  # launchd service
-├── README.md               # Documentation
-├── STATUS.md               # This file
-├── venv/                   # Python virtual environment
-└── mosquitto/              # Local broker config (optional)
+├── mqtt_logger.py           # Writer + reader backends, listener, main()
+├── query_events.py          # CLI query tool
+├── Dockerfile               # Container image
+├── entrypoint.sh            # Env-var → CLI flag translation for Docker
+├── docker-compose.yml       # Compose recipe
+├── alert_watcher.sh         # Tail data/alerts.log → macOS notifications
+├── com.blw.mqtt-logger.plist        # launchd config (daemon)
+├── com.blw.mqtt-alert-watcher.plist # launchd config (alert watcher)
+├── pyproject.toml           # pytest config
+├── tests/                   # 76 unit tests, no I/O
+├── data/                    # SQLite db + alerts.log (created on demand)
+├── mosquitto/               # Optional local broker config
+├── README.md
+└── STATUS.md                # This file
 ```
 
 ## Changelog
 
+### 1.1.0 — backend parity
+
+- MariaDB backend reaches feature-parity with SQLite: auto-schema, query
+  CLI, Docker support, unified alert-file location.
+- Query CLI (`query_events.py`) gained `--mariadb` flag mirroring the
+  daemon's flag layout. Wildcard `+` now respects MQTT level boundaries
+  in both backends (previously matched across `/`).
+- Flood-alert injection vulnerability closed: attacker-controlled MQTT
+  topics can no longer escape into AppleScript / shell context.
+- SQLite commits batched (25 rows / 1 s) — removes per-row fsync cost.
+- MariaDB reconnect-retry no longer silently drops the failing row.
+- LoopDetector switched to bounded `deque` + periodic idle eviction.
+- Dockerfile runs as non-root, installs PyMySQL + keyring.
+- 76 unit tests added (pure unit, no broker / DB / network).
+
 ### 1.0.0
-- Initial release
-- Full MQTT traffic capture
-- SQLite storage with indexes
-- Query tool with filtering
-- macOS launchd service support
+
+- Initial release with SQLite-only storage.

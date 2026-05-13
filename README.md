@@ -1,219 +1,214 @@
 # MQTT Event Logger
 
-A Python-based MQTT event logging and monitoring system that captures all MQTT messages from a broker and stores them in a SQLite database for analysis.
+Captures all MQTT messages from a broker and persists them to one or more
+database backends for later analysis.
+
+Two parallel backends are supported:
+
+- **SQLite** — single-file, no setup, ideal for embedded / "foreign"
+  deployments (e.g. running alongside audio-node or layout-coordinator on
+  hosts where running a database server isn't feasible).
+- **MariaDB / MySQL** — network-accessible, multi-writer friendly,
+  intended for the central logging host. Credentials are fetched from the
+  macOS Keychain at startup.
+
+Both backends can run simultaneously (useful during migration validation):
+every message is written to every configured backend.
 
 ## Features
 
-- Subscribes to all topics (`#`) for complete traffic capture
-- Stores messages with timestamp, topic, payload, QoS, and retained flag
-- Automatic sender extraction from JSON payloads
-- Handles binary payloads (stores as hex)
-- Query tool with topic filtering and time-based queries
-- Runs as macOS launchd background service
-- Rotating log files (5MB max, 3 backups)
+- Subscribes to `#` (all application topics; `$SYS` is excluded by brokers).
+- Stores timestamp, topic, payload, QoS, retained flag, and an extracted
+  sender (from common JSON keys like `board`, `sender`, `client_id`).
+- Binary payloads stored as hex.
+- Flood / loop detector: per-topic sliding-window rate limit; alerts go to
+  `data/alerts.log` and (on macOS) fire a native notification.
+- Query CLI with MQTT-aware wildcards (`+` single-level, `#` multi-level).
+- Runs as a Docker container, a macOS launchd service, or directly.
 
 ## Requirements
 
 - Python 3.10+
 - paho-mqtt 2.x
-- SQLite (built-in)
-- MQTT broker (e.g., Mosquitto)
+- PyMySQL + keyring (only when using the MariaDB backend)
+- An MQTT broker (e.g. Mosquitto)
 
-## Installation
+## Installation (local venv)
 
 ```bash
-# Clone or copy to desired location
-cd /path/to/mqtt-logger
-
-# Create virtual environment
 python3 -m venv venv
 source venv/bin/activate
-
-# Install dependencies
-pip install paho-mqtt
+pip install paho-mqtt PyMySQL keyring
 ```
 
-## Quick Start
+## Backend selection
 
-```bash
-source venv/bin/activate
+The logger and the query tool share the same flag layout. Backend selection
+is symmetric across both:
 
-# Run manually (broker must be running)
-python mqtt_logger.py --broker localhost --port 1883
+| Flag(s)                   | Result                                   |
+|---------------------------|------------------------------------------|
+| `--db PATH`               | SQLite at PATH                           |
+| `--mariadb`               | MariaDB (credentials from Keychain)      |
+| `--db PATH --mariadb`     | Both — dual-write / dual-query           |
+| _none_                    | SQLite at the default location           |
 
-# With verbose output
-python mqtt_logger.py -v
+MariaDB connection details (only meaningful when `--mariadb` is passed):
+
+```
+--mariadb-host HOST     default: localhost
+--mariadb-port PORT     default: 3306
+--mariadb-db   NAME     default: mqtt_log
 ```
 
-### Command Line Options
+### MariaDB credentials
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--broker`, `-b` | localhost | MQTT broker hostname |
-| `--port`, `-p` | 1883 | MQTT broker port |
-| `--db`, `-d` | mqtt_events.db | SQLite database path |
-| `--verbose`, `-v` | off | Enable debug logging |
-
-## Query Events
+Stored in the macOS Keychain — never in config files or command-line args.
 
 ```bash
-source venv/bin/activate
+# logger account (INSERT + SELECT only — used by the daemon)
+security add-generic-password -a logger -s mariadb-mqtt -w '<password>' -U
 
-# Recent events (default: 50)
+# root or admin (only used for schema bootstrap / migrations)
+security add-generic-password -a root   -s mariadb-mqtt -w '<password>' -U
+```
+
+The MariaDB backend will attempt `CREATE TABLE IF NOT EXISTS` on startup;
+this is a no-op against an existing table and is silently skipped when the
+configured user lacks the `CREATE` privilege.
+
+## Running the logger
+
+```bash
+# SQLite (default)
+python mqtt_logger.py --broker localhost
+
+# MariaDB only
+python mqtt_logger.py --broker localhost --mariadb
+
+# Dual-write
+python mqtt_logger.py --broker localhost --db data/mqtt_events.db --mariadb
+```
+
+## Querying
+
+`query_events.py` mirrors the same flags:
+
+```bash
+# Recent events from SQLite
 python query_events.py
 
-# List all topics with counts
-python query_events.py --topics
+# Recent events from MariaDB
+python query_events.py --mariadb
 
-# Filter by topic (supports # and + wildcards)
-python query_events.py --topic "cova/#"
+# MQTT topic filter — wildcards respect level boundaries
+python query_events.py --topic 'cova/+/status'     # one segment between
+python query_events.py --topic 'cova/#'            # any depth below
 
-# Events from last hour
+# Time window
 python query_events.py --since 1h
-
-# Events from last 7 days, limit 100
 python query_events.py --since 7d --limit 100
 
-# Database stats
+# Aggregate views
+python query_events.py --topics
 python query_events.py --stats
 ```
 
-### Query Options
+## Docker
 
-| Option | Description |
-|--------|-------------|
-| `--topics` | List unique topics with message counts |
-| `--topic`, `-t` | Filter by topic pattern (`#` = multi-level, `+` = single-level) |
-| `--since`, `-s` | Time filter: `30m`, `1h`, `7d` |
-| `--limit`, `-n` | Max events to display (default: 50) |
-| `--stats` | Show database statistics |
-| `--db` | Custom database path |
+`docker-compose.yml` exposes both backends via env vars. SQLite is on by
+default; set `MQTT_MARIADB=1` to enable MariaDB alongside or instead.
 
-## Docker (Recommended)
-
-### Quick Start
+```yaml
+environment:
+  - MQTT_BROKER=192.168.68.250
+  - MQTT_DB=/data/mqtt_events.db        # leave unset to disable SQLite
+  - MQTT_MARIADB=1                      # enable MariaDB
+  - MQTT_MARIADB_HOST=host.docker.internal
+  - MQTT_MARIADB_DB=mqtt_log
+```
 
 ```bash
-# If broker is running on the host machine
 docker compose up -d
-
-# Check logs
 docker compose logs -f
-
-# Stop
-docker compose down
-```
-
-### Configuration
-
-Set environment variables in `.env` or pass them directly:
-
-```bash
-# .env file
-MQTT_BROKER=192.168.1.100
-MQTT_PORT=1883
-```
-
-Or override on command line:
-```bash
-MQTT_BROKER=mybroker.local docker compose up -d
-```
-
-### Data Persistence
-
-The SQLite database is stored in a Docker volume (`mqtt-data`). To access it:
-
-```bash
-# Query events from host
 docker compose exec mqtt-logger python query_events.py --stats
-docker compose exec mqtt-logger python query_events.py --topics
-docker compose exec mqtt-logger python query_events.py --since 1h
-
-# Or copy the database out
-docker compose cp mqtt-logger:/data/mqtt_events.db ./mqtt_events.db
 ```
 
-### Build Only
+## macOS launchd service
 
 ```bash
-docker build -t mqtt-logger .
-docker run -d --name mqtt-logger \
-  -e MQTT_BROKER=host.docker.internal \
-  -v mqtt-data:/data \
-  --add-host=host.docker.internal:host-gateway \
-  mqtt-logger
-```
-
-## macOS launchd Service (Alternative)
-
-If you prefer running without Docker:
-
-### Install
-
-```bash
-# Symlink plist to LaunchAgents
 ln -s "$(pwd)/com.blw.mqtt-logger.plist" ~/Library/LaunchAgents/
-
-# Load the service
 launchctl load ~/Library/LaunchAgents/com.blw.mqtt-logger.plist
-
-# Check status
 launchctl list | grep mqtt
 ```
 
-### Manage
+The bundled plist runs the daemon with `--mariadb` (current production
+configuration). Adjust `ProgramArguments` to add `--db <path>` for
+dual-write or to switch to SQLite-only.
 
-```bash
-# View logs
-tail -f mqtt_logger.log
-
-# Unload service
-launchctl unload ~/Library/LaunchAgents/com.blw.mqtt-logger.plist
-
-# Reload after changes
-launchctl unload ~/Library/LaunchAgents/com.blw.mqtt-logger.plist
-launchctl load ~/Library/LaunchAgents/com.blw.mqtt-logger.plist
-```
-
-## Database Schema
+## Schema
 
 ```sql
+-- SQLite (auto-created by SQLiteBackend on first connect)
 CREATE TABLE mqtt_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,      -- ISO format
-    topic TEXT NOT NULL,          -- MQTT topic
-    sender TEXT,                  -- Extracted from payload
-    payload TEXT,                 -- Message content (or hex for binary)
-    qos INTEGER NOT NULL,         -- 0, 1, or 2
-    retained INTEGER NOT NULL     -- 0 or 1
+    timestamp TEXT NOT NULL,      -- ISO 8601
+    topic TEXT NOT NULL,
+    sender TEXT,
+    payload TEXT,                 -- text or hex of binary
+    qos INTEGER NOT NULL,
+    retained INTEGER NOT NULL
 );
-
--- Indexes
 CREATE INDEX idx_timestamp ON mqtt_events(timestamp);
-CREATE INDEX idx_topic ON mqtt_events(topic);
+CREATE INDEX idx_topic     ON mqtt_events(topic);
+
+-- MariaDB (best-effort auto-created; identical column semantics)
+CREATE TABLE mqtt_events (
+    id        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    timestamp DATETIME(6)     NOT NULL,
+    topic     VARCHAR(512)    NOT NULL,
+    sender    VARCHAR(255)    DEFAULT NULL,
+    payload   LONGTEXT        DEFAULT NULL,
+    qos       TINYINT         NOT NULL,
+    retained  TINYINT         NOT NULL,
+    KEY idx_timestamp (timestamp),
+    KEY idx_topic (topic(64))     -- prefix index on a long VARCHAR
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
-## Sender Extraction
+## Sender extraction
 
-The `sender` field is automatically extracted from JSON payloads by checking these fields in order:
-- `sender`
-- `client_id`
-- `clientId`
-- `source`
-- `from`
-- `device_id`
+The `sender` field is populated from one of two sources, in this order:
 
-Customize `mqtt_logger.py:extract_sender()` for your specific topic structure.
+1. **Topic pattern** — `log/{board}` or `{prefix}/config/(status|backup)/{board}`.
+2. **JSON payload key** — first match from: `board`, `sender`, `client_id`,
+   `clientId`, `source`, `from`, `device_id`.
+
+Customise [extract_sender()](mqtt_logger.py) for project-specific patterns.
 
 ## Files
 
-| File | Description |
-|------|-------------|
-| `mqtt_logger.py` | Main MQTT listener and database writer |
-| `query_events.py` | CLI query utility |
-| `mqtt_events.db` | SQLite database (created on first run) |
-| `mqtt_logger.log` | Application log (rotating) |
-| `com.blw.mqtt-logger.plist` | macOS launchd configuration |
+| File                                   | Description                              |
+|----------------------------------------|------------------------------------------|
+| `mqtt_logger.py`                       | MQTT listener + writer backends          |
+| `query_events.py`                      | CLI query tool (same backend selection)  |
+| `Dockerfile` / `entrypoint.sh`         | Container build + env-var → CLI mapping  |
+| `docker-compose.yml`                   | Compose recipe                           |
+| `com.blw.mqtt-logger.plist`            | macOS launchd config                     |
+| `alert_watcher.sh` / `com.blw.mqtt-alert-watcher.plist` | Flood-alert tailer + launchd config |
+| `data/mqtt_events.db` (if SQLite)      | Event store                              |
+| `data/alerts.log`                      | Flood-alert log (tailed by alert_watcher)|
+| `mqtt_logger.log`                      | Application log (rotating)               |
+| `tests/`                               | pytest suite (76 unit tests, no I/O)     |
+
+## Tests
+
+```bash
+pip install pytest pytest-mock freezegun
+pytest tests/
+```
+
+Pure unit tests; no broker / DB / network required.
 
 ## License
 

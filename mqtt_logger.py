@@ -134,6 +134,25 @@ class MariaDBBackend(DatabaseBackend):
     # Reconnect on transient errors rather than crashing the process.
     _RETRYABLE = {2006, 2013, 2055}   # CR_SERVER_GONE, CR_SERVER_LOST, etc.
 
+    # Mirror of the SQLite schema. Mechanism is `CREATE TABLE IF NOT EXISTS`
+    # so re-running against the existing table is a no-op. If the configured
+    # user lacks CREATE privilege (the usual production setup — the `logger`
+    # account is INSERT+SELECT only), the failure is logged at debug and
+    # ignored; insertion will surface a real error if the table is missing.
+    _DDL = (
+        '''CREATE TABLE IF NOT EXISTS mqtt_events (
+            id        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            timestamp DATETIME(6)     NOT NULL,
+            topic     VARCHAR(512)    NOT NULL,
+            sender    VARCHAR(255)    DEFAULT NULL,
+            payload   LONGTEXT        DEFAULT NULL,
+            qos       TINYINT         NOT NULL,
+            retained  TINYINT         NOT NULL,
+            KEY idx_timestamp (timestamp),
+            KEY idx_topic (topic(64))
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci''',
+    )
+
     def __init__(self, host: str = 'localhost', port: int = 3306,
                  database: str = 'mqtt_log', user: str = 'logger'):
         import pymysql
@@ -154,7 +173,27 @@ class MariaDBBackend(DatabaseBackend):
         )
         self._pymysql = pymysql
         self._conn = self._connect()
+        self._ensure_schema()
         logger.info(f"MariaDB backend ready: {user}@{host}:{port}/{database}")
+
+    def _ensure_schema(self) -> None:
+        """Best-effort schema creation. Mirrors SQLiteBackend.__init__, but
+        gracefully skips when the configured user has no CREATE privilege —
+        which is the expected case for the production `logger` account."""
+        try:
+            with self._conn.cursor() as cur:
+                for stmt in self._DDL:
+                    cur.execute(stmt)
+        except self._pymysql.OperationalError as exc:
+            # 1142 = ER_TABLEACCESS_DENIED_ERROR — fine, schema was provisioned
+            # out-of-band. Any other operational error is real and worth raising.
+            if exc.args[0] == 1142:
+                logger.debug(
+                    "MariaDB user lacks CREATE on mqtt_events; "
+                    "assuming schema is provisioned out-of-band"
+                )
+            else:
+                raise
 
     @property
     def name(self) -> str:
@@ -186,6 +225,187 @@ class MariaDBBackend(DatabaseBackend):
                 (timestamp, topic, sender, payload, qos, retained)
                 # pymysql accepts datetime objects directly — no ISO formatting needed
             )
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
+# ─── Query backends ───────────────────────────────────────────────────────────
+#
+# Parallel hierarchy to the writer backends above, used by query_events.py.
+# The CLI tool needs to read from whichever store the daemon is writing to,
+# so the two backends must support the same set of read operations.
+# Differences are limited to: SQL dialect (placeholders, regex), how
+# timestamps are stored, and how the wildcard filter is implemented.
+
+
+class QueryBackend(ABC):
+    """Common interface for read-side backends used by query_events.py."""
+
+    @abstractmethod
+    def query_events(self, topic_pattern: str | None, since: datetime | None,
+                     limit: int): ...
+
+    @abstractmethod
+    def list_topics(self): ...
+
+    @abstractmethod
+    def stats(self) -> dict: ...
+
+    @abstractmethod
+    def close(self) -> None: ...
+
+
+def _mqtt_pattern_to_regex(pattern: str) -> str:
+    """Translate an MQTT topic filter to an anchored regular expression.
+
+    `+` matches exactly one level (no `/`); `#` matches one or more levels
+    and is only legal as the final segment. Both backends use the same
+    translation — SQLite executes it via a Python UDF, MariaDB via REGEXP.
+    """
+    segments = pattern.split('/')
+    parts = []
+    for i, seg in enumerate(segments):
+        if seg == '+':
+            parts.append(r'[^/]+')
+        elif seg == '#':
+            if i != len(segments) - 1:
+                raise ValueError(
+                    f"'#' is only allowed as the final segment of an MQTT filter "
+                    f"(got: {pattern!r})"
+                )
+            parts.append(r'.+')
+        else:
+            import re as _re
+            parts.append(_re.escape(seg))
+    return '^' + '/'.join(parts) + '$'
+
+
+class SQLiteQueryBackend(QueryBackend):
+    """Read-only view over the SQLite event store."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._conn = sqlite3.connect(db_path)
+
+    def _compile_topic_filter(self, topic_pattern: str | None):
+        """Returns (sql_fragment, params). For wildcard patterns, registers a
+        per-call UDF on the connection rather than translating to LIKE — `%`
+        crosses `/` boundaries, which violates MQTT level semantics."""
+        if not topic_pattern:
+            return "", []
+        if '+' in topic_pattern or '#' in topic_pattern:
+            import re as _re
+            compiled = _re.compile(_mqtt_pattern_to_regex(topic_pattern))
+            self._conn.create_function(
+                'mqtt_match', 1, lambda t: bool(compiled.match(t or ''))
+            )
+            return " AND mqtt_match(topic)", []
+        return " AND topic = ?", [topic_pattern]
+
+    def query_events(self, topic_pattern, since, limit):
+        sql = ('SELECT timestamp, topic, sender, payload, qos, retained '
+               'FROM mqtt_events WHERE 1=1')
+        params = []
+        frag, p = self._compile_topic_filter(topic_pattern)
+        sql += frag
+        params.extend(p)
+        if since is not None:
+            sql += ' AND timestamp >= ?'
+            params.append(since.isoformat())
+        sql += ' ORDER BY timestamp DESC LIMIT ?'
+        params.append(limit)
+        return self._conn.execute(sql, params)
+
+    def list_topics(self):
+        return self._conn.execute(
+            'SELECT topic, COUNT(*) AS c FROM mqtt_events '
+            'GROUP BY topic ORDER BY c DESC'
+        )
+
+    def stats(self) -> dict:
+        c = self._conn
+        return {
+            'total_events':   c.execute('SELECT COUNT(*) FROM mqtt_events').fetchone()[0],
+            'unique_topics':  c.execute('SELECT COUNT(DISTINCT topic) FROM mqtt_events').fetchone()[0],
+            'retained_count': c.execute('SELECT COUNT(*) FROM mqtt_events WHERE retained=1').fetchone()[0],
+            'first_event':    c.execute('SELECT MIN(timestamp) FROM mqtt_events').fetchone()[0],
+            'last_event':     c.execute('SELECT MAX(timestamp) FROM mqtt_events').fetchone()[0],
+        }
+
+    def close(self):
+        self._conn.close()
+
+
+class MariaDBQueryBackend(QueryBackend):
+    """Read-only view over the MariaDB event store. Mirrors the SQLite
+    backend's surface — only the dialect differs."""
+
+    def __init__(self, host: str = 'localhost', port: int = 3306,
+                 database: str = 'mqtt_log', user: str = 'logger'):
+        import pymysql
+        import keyring
+        password = keyring.get_password("mariadb-mqtt", user)
+        if not password:
+            raise RuntimeError(
+                f"No password found in Keychain for mariadb-mqtt/{user}. "
+                f"Run: security add-generic-password -a {user} "
+                f"-s mariadb-mqtt -w <password> -U"
+            )
+        self._conn = pymysql.connect(
+            host=host, port=port, user=user, password=password,
+            database=database, charset='utf8mb4',
+        )
+
+    def _topic_filter(self, topic_pattern: str | None):
+        if not topic_pattern:
+            return "", []
+        if '+' in topic_pattern or '#' in topic_pattern:
+            return " AND topic REGEXP %s", [_mqtt_pattern_to_regex(topic_pattern)]
+        return " AND topic = %s", [topic_pattern]
+
+    def query_events(self, topic_pattern, since, limit):
+        sql = ('SELECT timestamp, topic, sender, payload, qos, retained '
+               'FROM mqtt_events WHERE 1=1')
+        params = []
+        frag, p = self._topic_filter(topic_pattern)
+        sql += frag
+        params.extend(p)
+        if since is not None:
+            sql += ' AND timestamp >= %s'
+            params.append(since)   # pymysql formats datetime correctly
+        sql += ' ORDER BY timestamp DESC LIMIT %s'
+        params.append(limit)
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            yield from cur.fetchall()
+
+    def list_topics(self):
+        with self._conn.cursor() as cur:
+            cur.execute(
+                'SELECT topic, COUNT(*) AS c FROM mqtt_events '
+                'GROUP BY topic ORDER BY c DESC'
+            )
+            yield from cur.fetchall()
+
+    def stats(self) -> dict:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                'SELECT COUNT(*), COUNT(DISTINCT topic), '
+                'SUM(retained=1), MIN(timestamp), MAX(timestamp) '
+                'FROM mqtt_events'
+            )
+            total, unique, retained, first, last = cur.fetchone()
+            return {
+                'total_events': total or 0,
+                'unique_topics': unique or 0,
+                'retained_count': int(retained or 0),
+                'first_event': first,
+                'last_event': last,
+            }
 
     def close(self):
         try:
@@ -468,14 +688,13 @@ def main():
         logger.warning(f"No backend specified — defaulting to SQLite: {db_path}")
         backends.append(SQLiteBackend(str(db_path)))
 
-    # Alert file lives next to the SQLite DB when one is active, otherwise
-    # next to the script. The path comes from the backend's own db_path attr
-    # rather than PRAGMA database_list — easier to test and to reason about.
-    sqlite_backends = [b for b in backends if isinstance(b, SQLiteBackend)]
-    if sqlite_backends:
-        alert_file = str(Path(sqlite_backends[0].db_path).parent / 'alerts.log')
-    else:
-        alert_file = str(script_dir / 'alerts.log')
+    # Alert file location is fixed at <script_dir>/data/alerts.log regardless
+    # of which backend(s) are active — this matches alert_watcher.sh and the
+    # Docker bind-mount. The directory is created on demand so a fresh
+    # checkout works without manual setup.
+    data_dir = script_dir / 'data'
+    data_dir.mkdir(parents=True, exist_ok=True)
+    alert_file = str(data_dir / 'alerts.log')
 
     mqtt_logger = MQTTLogger(args.broker, args.port, backends,
                              alert_file=alert_file)
