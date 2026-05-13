@@ -151,7 +151,7 @@ mqtt-logger/
 ├── com.blw.mqtt-logger.plist        # launchd config (daemon)
 ├── com.blw.mqtt-alert-watcher.plist # launchd config (alert watcher)
 ├── pyproject.toml           # pytest config
-├── tests/                   # 76 unit tests, no I/O
+├── tests/                   # 78 unit tests (no I/O) + 61 integration (containers)
 ├── data/                    # SQLite db + alerts.log (created on demand)
 ├── mosquitto/               # Optional local broker config
 ├── README.md
