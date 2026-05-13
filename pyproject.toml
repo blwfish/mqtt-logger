@@ -1,9 +1,19 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers"
+# Default run skips the integration tier so the fast feedback loop stays
+# at sub-second latency. Use `pytest -m integration` to run integration
+# tests (requires Docker, pulls eclipse-mosquitto + mariadb images on
+# first run, takes 10-30s for container startup).
+addopts = "-ra --strict-markers -m 'not integration'"
+markers = [
+    "integration: end-to-end tests that spin up real mosquitto + mariadb containers via testcontainers",
+]
 filterwarnings = [
     "error",
     # paho-mqtt 2.x emits a DeprecationWarning on CallbackAPIVersion access
     # in some Python builds — ignore so the suite stays clean.
     "ignore::DeprecationWarning",
+    # testcontainers / docker SDK can emit ResourceWarnings on container
+    # cleanup that aren't actionable from the test side.
+    "ignore::ResourceWarning",
 ]

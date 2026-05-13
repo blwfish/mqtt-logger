@@ -99,6 +99,7 @@ def build_backend(args) -> QueryBackend:
             host=args.mariadb_host,
             port=args.mariadb_port,
             database=args.mariadb_db,
+            user=args.mariadb_user,
         )
 
     db_path = Path(args.db) if args.db else default_sqlite_path()
@@ -125,6 +126,8 @@ def main():
                         help='MariaDB port (default: 3306)')
     parser.add_argument('--mariadb-db', default='mqtt_log',
                         help='MariaDB database name (default: mqtt_log)')
+    parser.add_argument('--mariadb-user', default='logger',
+                        help='MariaDB user (default: logger)')
 
     parser.add_argument('--topics', action='store_true',
                         help='List unique topics with message counts')

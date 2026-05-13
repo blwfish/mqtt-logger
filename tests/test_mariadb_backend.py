@@ -19,18 +19,35 @@ def make_backend(fake_pymysql, fake_keyring, monkeypatch, password="secret"):
 
 
 class TestStartup:
-    def test_missing_password_raises(self, fake_pymysql, fake_keyring):
+    def test_missing_password_raises(self, fake_pymysql, fake_keyring,
+                                     monkeypatch):
         from mqtt_logger import MariaDBBackend
         fake_keyring._password = None
-        with pytest.raises(RuntimeError, match="No password found in Keychain"):
+        monkeypatch.delenv("MQTT_LOGGER_MARIADB_PASSWORD", raising=False)
+        with pytest.raises(RuntimeError, match="No MariaDB password found"):
             MariaDBBackend(user="u")
 
     def test_error_message_includes_security_command(self, fake_pymysql,
-                                                     fake_keyring):
+                                                     fake_keyring, monkeypatch):
         from mqtt_logger import MariaDBBackend
         fake_keyring._password = None
+        monkeypatch.delenv("MQTT_LOGGER_MARIADB_PASSWORD", raising=False)
         with pytest.raises(RuntimeError, match="security add-generic-password"):
             MariaDBBackend(user="u")
+
+    def test_env_var_overrides_keyring(self, fake_pymysql, fake_keyring,
+                                       monkeypatch):
+        """Regression: MQTT_LOGGER_MARIADB_PASSWORD should take precedence
+        over Keychain, so integration tests and Linux containers without a
+        Keychain can supply credentials."""
+        from mqtt_logger import MariaDBBackend
+        from unittest.mock import MagicMock
+        fake_keyring._password = "from-keyring"
+        monkeypatch.setenv("MQTT_LOGGER_MARIADB_PASSWORD", "from-env")
+        fake_pymysql.connect = MagicMock(return_value=MagicMock())
+
+        MariaDBBackend(user="u")
+        assert fake_pymysql.connect.call_args.kwargs["password"] == "from-env"
 
     def test_successful_connect(self, fake_pymysql, fake_keyring, monkeypatch):
         backend, fake_conn = make_backend(fake_pymysql, fake_keyring,
@@ -158,3 +175,22 @@ class TestRetry:
         with pytest.raises(fake_pymysql.OperationalError):
             backend.insert(datetime.now(), "t", None, "p", 0, 0)
         fake_pymysql.connect.assert_not_called()
+
+    def test_interface_error_triggers_reconnect(self, fake_pymysql,
+                                                fake_keyring, monkeypatch):
+        """Regression for an issue surfaced by integration tests:
+        pymysql.InterfaceError fires when the underlying socket is already
+        closed (typically because MariaDB's wait_timeout dropped an idle
+        connection). The retry path must catch this too, not only
+        OperationalError."""
+        backend, fake_conn = make_backend(fake_pymysql, fake_keyring,
+                                          monkeypatch)
+        first_cursor = fake_conn.cursor.return_value.__enter__.return_value
+        first_cursor.execute.side_effect = fake_pymysql.InterfaceError(0, "")
+        new_conn = MagicMock(name="new_conn")
+        new_cursor = new_conn.cursor.return_value.__enter__.return_value
+        fake_pymysql.connect = MagicMock(side_effect=[new_conn])
+
+        backend.insert(datetime.now(), "t", None, "p", 0, 0)
+        assert new_cursor.execute.call_count == 1
+        assert backend._conn is new_conn

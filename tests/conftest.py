@@ -41,7 +41,11 @@ def fake_pymysql(monkeypatch):
     class OperationalError(Exception):
         pass
 
+    class InterfaceError(Exception):
+        pass
+
     fake.OperationalError = OperationalError
+    fake.InterfaceError = InterfaceError
     fake.connect = None  # callers will override per-test
     monkeypatch.setitem(sys.modules, "pymysql", fake)
     return fake

@@ -203,12 +203,36 @@ Customise [extract_sender()](mqtt_logger.py) for project-specific patterns.
 
 ## Tests
 
+Two tiers:
+
 ```bash
+# Unit (default — runs by default; sub-second, no I/O)
 pip install pytest pytest-mock freezegun
-pytest tests/
+pytest
+
+# Integration (opt-in; spins up disposable mosquitto + mariadb
+# containers via testcontainers; ~30 s including image pull on first run)
+pip install 'testcontainers[mariadb]'
+pytest -m integration
+
+# Everything
+pytest -m 'integration or not integration'
 ```
 
-Pure unit tests; no broker / DB / network required.
+The integration tier covers MariaDB dialect quirks (REGEXP semantics,
+utf8mb4 round-trip, DATETIME(6) precision, reconnect after server-side
+KILL), the MQTT publish-to-DB pipeline through real paho callbacks, the
+daemon as a subprocess (SIGTERM/SIGINT lifecycle), flood detection over
+a real burst, and broker-restart resubscription. Parametrized tests in
+`test_dialect_parity.py` run the same body against both backends — a
+test that passes on one and fails on the other is a parity bug.
+
+### Credentials in tests / non-Keychain environments
+
+MariaDB credentials are looked up first from `MQTT_LOGGER_MARIADB_PASSWORD`
+(env var), then from the macOS Keychain. The env var is a documented
+fallback for Linux containers, CI environments, and tests — production
+hosts should use the Keychain.
 
 ## License
 

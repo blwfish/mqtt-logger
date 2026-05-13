@@ -25,6 +25,7 @@ import argparse
 import json
 import logging
 import logging.handlers
+import os
 import platform
 import signal
 import sqlite3
@@ -120,14 +121,41 @@ class SQLiteBackend(DatabaseBackend):
             self._conn.close()
 
 
+_MARIADB_PASSWORD_ENV = "MQTT_LOGGER_MARIADB_PASSWORD"
+
+
+def _resolve_mariadb_password(user: str) -> str:
+    """Resolve the MariaDB password from (in order): environment, then keyring.
+
+    The env var is documented as a fallback for environments without a
+    Keychain-compatible store (e.g. Linux containers without dbus, or
+    integration tests) — production hosts should use the Keychain.
+    """
+    env_pw = os.environ.get(_MARIADB_PASSWORD_ENV)
+    if env_pw:
+        return env_pw
+    import keyring
+    pw = keyring.get_password("mariadb-mqtt", user)
+    if pw:
+        return pw
+    raise RuntimeError(
+        f"No MariaDB password found for user {user!r}. "
+        f"Either set ${_MARIADB_PASSWORD_ENV}, or store the password in "
+        f"the Keychain: "
+        f"security add-generic-password -a {user} -s mariadb-mqtt -w <pw> -U"
+    )
+
+
 class MariaDBBackend(DatabaseBackend):
     """MariaDB/MySQL backend — network-accessible, least-privilege account.
 
-    Credentials are fetched from the macOS Keychain at startup:
-        service = "mariadb-mqtt"
-        account = "logger"   (INSERT + SELECT only — cannot DELETE or DROP)
+    Credentials are resolved in order:
+        1. environment variable MQTT_LOGGER_MARIADB_PASSWORD (fallback)
+        2. macOS Keychain (preferred)
+               service = "mariadb-mqtt"
+               account = "logger"   (INSERT + SELECT only)
 
-    To store / update the password:
+    To store / update the password in the Keychain:
         security add-generic-password -a logger -s mariadb-mqtt -w <pw> -U
     """
 
@@ -156,15 +184,8 @@ class MariaDBBackend(DatabaseBackend):
     def __init__(self, host: str = 'localhost', port: int = 3306,
                  database: str = 'mqtt_log', user: str = 'logger'):
         import pymysql
-        import keyring
 
-        password = keyring.get_password("mariadb-mqtt", user)
-        if not password:
-            raise RuntimeError(
-                f"No password found in Keychain for mariadb-mqtt/{user}. "
-                f"Run: security add-generic-password -a {user} "
-                f"-s mariadb-mqtt -w <password> -U"
-            )
+        password = _resolve_mariadb_password(user)
 
         self._connect_args = dict(
             host=host, port=port, user=user, password=password,
@@ -209,12 +230,26 @@ class MariaDBBackend(DatabaseBackend):
         except self._pymysql.OperationalError as exc:
             if exc.args[0] not in self._RETRYABLE:
                 raise
-            logger.warning(f"MariaDB connection lost ({exc.args[0]}), reconnecting...")
-            # Reconnect once. If anything below fails — connect or insert —
-            # we re-raise so the outer handler logs the dropped row instead
-            # of silently swallowing it.
-            self._conn = self._connect()
-            self._do_insert(timestamp, topic, sender, payload, qos, retained)
+            self._reconnect_and_retry("OperationalError", exc.args[0],
+                                      timestamp, topic, sender, payload,
+                                      qos, retained)
+        except self._pymysql.InterfaceError as exc:
+            # Raised when the underlying socket is already closed — usually
+            # the server's wait_timeout fired during a quiet period. pymysql
+            # surfaces this as InterfaceError(0, "") rather than an
+            # OperationalError, so we have to handle it separately.
+            self._reconnect_and_retry("InterfaceError", exc.args[0] if exc.args else None,
+                                      timestamp, topic, sender, payload,
+                                      qos, retained)
+
+    def _reconnect_and_retry(self, exc_kind, code, timestamp, topic, sender,
+                             payload, qos, retained):
+        logger.warning(f"MariaDB connection lost ({exc_kind} {code}), reconnecting...")
+        # If reconnect or the retried insert fails, the exception propagates
+        # so the outer handler logs the dropped row instead of silently
+        # swallowing it.
+        self._conn = self._connect()
+        self._do_insert(timestamp, topic, sender, payload, qos, retained)
 
     def _do_insert(self, timestamp, topic, sender, payload, qos, retained):
         with self._conn.cursor() as cur:
@@ -347,14 +382,7 @@ class MariaDBQueryBackend(QueryBackend):
     def __init__(self, host: str = 'localhost', port: int = 3306,
                  database: str = 'mqtt_log', user: str = 'logger'):
         import pymysql
-        import keyring
-        password = keyring.get_password("mariadb-mqtt", user)
-        if not password:
-            raise RuntimeError(
-                f"No password found in Keychain for mariadb-mqtt/{user}. "
-                f"Run: security add-generic-password -a {user} "
-                f"-s mariadb-mqtt -w <password> -U"
-            )
+        password = _resolve_mariadb_password(user)
         self._conn = pymysql.connect(
             host=host, port=port, user=user, password=password,
             database=database, charset='utf8mb4',
@@ -657,6 +685,12 @@ def main():
                         help='MariaDB port (default: 3306)')
     parser.add_argument('--mariadb-db', default='mqtt_log',
                         help='MariaDB database name (default: mqtt_log)')
+    parser.add_argument('--mariadb-user', default='logger',
+                        help='MariaDB user (default: logger)')
+
+    parser.add_argument('--alert-file', default=None,
+                        help='Override path for flood alerts '
+                             '(default: <script_dir>/data/alerts.log)')
 
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose logging')
@@ -680,6 +714,7 @@ def main():
             host=args.mariadb_host,
             port=args.mariadb_port,
             database=args.mariadb_db,
+            user=args.mariadb_user,
         ))
 
     if not backends:
@@ -688,13 +723,17 @@ def main():
         logger.warning(f"No backend specified — defaulting to SQLite: {db_path}")
         backends.append(SQLiteBackend(str(db_path)))
 
-    # Alert file location is fixed at <script_dir>/data/alerts.log regardless
+    # Alert file location defaults to <script_dir>/data/alerts.log regardless
     # of which backend(s) are active — this matches alert_watcher.sh and the
     # Docker bind-mount. The directory is created on demand so a fresh
-    # checkout works without manual setup.
-    data_dir = script_dir / 'data'
-    data_dir.mkdir(parents=True, exist_ok=True)
-    alert_file = str(data_dir / 'alerts.log')
+    # checkout works without manual setup. Tests override via --alert-file.
+    if args.alert_file:
+        alert_file = args.alert_file
+        Path(alert_file).parent.mkdir(parents=True, exist_ok=True)
+    else:
+        data_dir = script_dir / 'data'
+        data_dir.mkdir(parents=True, exist_ok=True)
+        alert_file = str(data_dir / 'alerts.log')
 
     mqtt_logger = MQTTLogger(args.broker, args.port, backends,
                              alert_file=alert_file)

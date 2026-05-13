@@ -33,7 +33,8 @@ The live launchd plist runs `--mariadb` only. SQLite is enabled by adding
 | launchd (logger)    | `com.blw.mqtt-logger.plist`       | Complete |
 | launchd (watcher)   | `com.blw.mqtt-alert-watcher.plist`| Complete |
 | Docker              | `Dockerfile` + `entrypoint.sh`    | Complete |
-| Unit tests          | `tests/`                          | 76 tests |
+| Unit tests          | `tests/*.py`                      | 78 tests |
+| Integration tests   | `tests/integration/`              | 44 tests, 1 skip |
 
 ## Features
 
@@ -108,6 +109,35 @@ mqtt-logger/
 ```
 
 ## Changelog
+
+### 1.2.0 — integration test tier
+
+- New tier of 44 integration tests under `tests/integration/`, gated by
+  the `integration` pytest marker. Disposable Mosquitto + MariaDB
+  containers via testcontainers-python. Default `pytest` invocation
+  still runs only the 78-test unit tier (~0.1 s); `pytest -m integration`
+  runs the integration tier (~30 s).
+- Parameterized dialect-parity tests in `test_dialect_parity.py`: the
+  same test body runs against both SQLite and MariaDB.
+- Daemon-as-subprocess tests covering SIGTERM/SIGINT graceful shutdown
+  and the batched-commit flush-on-close guarantee.
+- Reconnect tests for both MariaDB (server-side KILL) and MQTT broker
+  (container stop/start).
+- Real-flood test verifies alerts.log is written through the full
+  pipeline, and that cooldown suppresses duplicate alerts.
+- Bug fixed (surfaced by integration test): the reconnect path now also
+  catches `pymysql.InterfaceError`, not just `OperationalError`.
+  pymysql raises `InterfaceError(0, "")` when the socket has already
+  closed (typical of `wait_timeout`-dropped idle connections); previous
+  code would let this propagate and drop the row.
+- New CLI flag `--alert-file` overrides the flood-alert path (used by
+  integration tests; defaults match production).
+- New CLI flag `--mariadb-user` on both `mqtt_logger.py` and
+  `query_events.py` (default still `logger`).
+- New `MQTT_LOGGER_MARIADB_PASSWORD` env-var fallback for MariaDB
+  credentials — used by integration tests and Linux deployments
+  without a Keychain-compatible store; Keychain remains the preferred
+  primary source.
 
 ### 1.1.0 — backend parity
 
