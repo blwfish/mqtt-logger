@@ -11,9 +11,35 @@ Usage:
 """
 
 import argparse
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
+
+
+def mqtt_pattern_to_regex(pattern: str) -> str:
+    """Translate an MQTT topic filter to an anchored regular expression.
+
+    MQTT semantics: `+` matches exactly one level (no `/`), `#` matches one or
+    more levels and is only legal as the final segment. Translating both to
+    SQL `%` (as the previous implementation did) is wrong because `%` crosses
+    `/` boundaries — `cova/+/foo` would have matched `cova/a/b/foo`.
+    """
+    segments = pattern.split('/')
+    parts = []
+    for i, seg in enumerate(segments):
+        if seg == '+':
+            parts.append(r'[^/]+')
+        elif seg == '#':
+            if i != len(segments) - 1:
+                raise ValueError(
+                    f"'#' is only allowed as the final segment of an MQTT filter "
+                    f"(got: {pattern!r})"
+                )
+            parts.append(r'.+')
+        else:
+            parts.append(re.escape(seg))
+    return '^' + '/'.join(parts) + '$'
 
 
 def get_db_path():
@@ -81,10 +107,18 @@ def query_events(conn: sqlite3.Connection, topic_pattern: str = None,
     params = []
 
     if topic_pattern:
-        # Convert MQTT wildcard to SQL LIKE pattern
-        sql_pattern = topic_pattern.replace('#', '%').replace('+', '%')
-        query += ' AND topic LIKE ?'
-        params.append(sql_pattern)
+        if '+' in topic_pattern or '#' in topic_pattern:
+            # Register a UDF that respects MQTT level boundaries. Done inline
+            # because the helper has no state and the connection is short-lived.
+            regex = mqtt_pattern_to_regex(topic_pattern)
+            compiled = re.compile(regex)
+            conn.create_function(
+                'mqtt_match', 1, lambda t: bool(compiled.match(t or ''))
+            )
+            query += ' AND mqtt_match(topic)'
+        else:
+            query += ' AND topic = ?'
+            params.append(topic_pattern)
 
     if since:
         try:

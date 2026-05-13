@@ -29,9 +29,9 @@ import platform
 import signal
 import sqlite3
 import subprocess
-import sys
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -58,9 +58,19 @@ class DatabaseBackend(ABC):
 
 
 class SQLiteBackend(DatabaseBackend):
-    """SQLite backend — legacy, single-file, local only."""
+    """SQLite backend — legacy, single-file, local only.
+
+    Inserts are grouped: a commit fires every COMMIT_EVERY rows or when
+    COMMIT_INTERVAL_SEC has elapsed since the previous commit, whichever
+    comes first. Avoids the fsync-per-row cost without dropping more than
+    one batch on a crash.
+    """
+
+    COMMIT_EVERY = 25
+    COMMIT_INTERVAL_SEC = 1.0
 
     def __init__(self, db_path: str):
+        self.db_path = db_path
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute('PRAGMA journal_mode=WAL')
         self._conn.execute('''
@@ -79,6 +89,8 @@ class SQLiteBackend(DatabaseBackend):
         self._conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_topic ON mqtt_events(topic)')
         self._conn.commit()
+        self._pending = 0
+        self._last_commit = time.monotonic()
         logger.info(f"SQLite backend ready: {db_path}")
 
     @property
@@ -92,10 +104,20 @@ class SQLiteBackend(DatabaseBackend):
             'VALUES (?, ?, ?, ?, ?, ?)',
             (timestamp.isoformat(), topic, sender, payload, qos, retained)
         )
-        self._conn.commit()
+        self._pending += 1
+        now = time.monotonic()
+        if (self._pending >= self.COMMIT_EVERY
+                or now - self._last_commit >= self.COMMIT_INTERVAL_SEC):
+            self._conn.commit()
+            self._pending = 0
+            self._last_commit = now
 
     def close(self):
-        self._conn.close()
+        try:
+            if self._pending:
+                self._conn.commit()
+        finally:
+            self._conn.close()
 
 
 class MariaDBBackend(DatabaseBackend):
@@ -146,15 +168,14 @@ class MariaDBBackend(DatabaseBackend):
         try:
             self._do_insert(timestamp, topic, sender, payload, qos, retained)
         except self._pymysql.OperationalError as exc:
-            if exc.args[0] in self._RETRYABLE:
-                logger.warning(f"MariaDB connection lost ({exc.args[0]}), reconnecting...")
-                try:
-                    self._conn = self._connect()
-                    self._do_insert(timestamp, topic, sender, payload, qos, retained)
-                except Exception as retry_exc:
-                    logger.error(f"MariaDB retry failed: {retry_exc}")
-            else:
+            if exc.args[0] not in self._RETRYABLE:
                 raise
+            logger.warning(f"MariaDB connection lost ({exc.args[0]}), reconnecting...")
+            # Reconnect once. If anything below fails — connect or insert —
+            # we re-raise so the outer handler logs the dropped row instead
+            # of silently swallowing it.
+            self._conn = self._connect()
+            self._do_insert(timestamp, topic, sender, payload, qos, retained)
 
     def _do_insert(self, timestamp, topic, sender, payload, qos, retained):
         with self._conn.cursor() as cur:
@@ -226,25 +247,56 @@ class LoopDetector:
     THRESHOLD = 10        # Messages per window to trigger alert
     COOLDOWN_SEC = 60     # Suppress repeat alerts per topic
 
+    # Periodically evict topics that haven't been seen for a long time so the
+    # internal dicts can't grow without bound. The interval is wall-clockless —
+    # eviction runs every Nth call to record().
+    _EVICT_EVERY = 1024
+    _EVICT_IDLE_SEC = 300
+
     def __init__(self, alert_file: str | None = None):
-        self._counts: dict[str, list[float]] = {}
+        self._counts: dict[str, deque[float]] = {}
+        self._last_seen: dict[str, float] = {}
         self._last_alert: dict[str, float] = {}
         self._alert_file = alert_file
+        self._records_since_evict = 0
 
     def record(self, topic: str) -> None:
         now = time.monotonic()
-        timestamps = self._counts.setdefault(topic, [])
+        timestamps = self._counts.setdefault(topic, deque())
         timestamps.append(now)
+        self._last_seen[topic] = now
 
         cutoff = now - self.WINDOW_SEC
         while timestamps and timestamps[0] < cutoff:
-            timestamps.pop(0)
+            timestamps.popleft()
 
         if len(timestamps) >= self.THRESHOLD:
             last = self._last_alert.get(topic, 0)
             if now - last >= self.COOLDOWN_SEC:
                 self._last_alert[topic] = now
                 self._alert(topic, len(timestamps))
+
+        self._records_since_evict += 1
+        if self._records_since_evict >= self._EVICT_EVERY:
+            self._evict_idle(now)
+            self._records_since_evict = 0
+
+    def _evict_idle(self, now: float) -> None:
+        idle_cutoff = now - self._EVICT_IDLE_SEC
+        idle = [t for t, seen in self._last_seen.items() if seen < idle_cutoff]
+        for t in idle:
+            self._counts.pop(t, None)
+            self._last_seen.pop(t, None)
+            self._last_alert.pop(t, None)
+
+    # AppleScript template — receives the message as argv[1], title as argv[2],
+    # so the (attacker-controlled) topic can never break out of the string literal.
+    _OSASCRIPT_TEMPLATE = (
+        'on run argv\n'
+        '  display notification (item 1 of argv) '
+        'with title (item 2 of argv) sound name "Sosumi"\n'
+        'end run'
+    )
 
     def _alert(self, topic: str, count: int) -> None:
         msg = f"MQTT flood: {count} msgs in {self.WINDOW_SEC}s on {topic}"
@@ -260,9 +312,8 @@ class LoopDetector:
         if platform.system() == 'Darwin':
             try:
                 subprocess.Popen([
-                    'osascript', '-e',
-                    f'display notification "{msg}" '
-                    f'with title "MQTT Loop Detected" sound name "Sosumi"'
+                    'osascript', '-e', self._OSASCRIPT_TEMPLATE,
+                    '--', msg, 'MQTT Loop Detected',
                 ])
             except Exception:
                 pass
@@ -277,7 +328,6 @@ class MQTTLogger:
         self.broker = broker
         self.port = port
         self.backends = backends
-        self.running = True
         self.loop_detector = LoopDetector(alert_file=alert_file)
 
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -344,7 +394,8 @@ class MQTTLogger:
         logger.info("MQTT Logger stopped")
 
     def stop(self):
-        self.running = False
+        # paho.loop_forever() exits cleanly when disconnect() is called from
+        # any thread, including a signal handler.
         self.client.disconnect()
 
 
@@ -417,11 +468,12 @@ def main():
         logger.warning(f"No backend specified — defaulting to SQLite: {db_path}")
         backends.append(SQLiteBackend(str(db_path)))
 
-    # Alert file next to SQLite DB (or script dir if MariaDB-only)
+    # Alert file lives next to the SQLite DB when one is active, otherwise
+    # next to the script. The path comes from the backend's own db_path attr
+    # rather than PRAGMA database_list — easier to test and to reason about.
     sqlite_backends = [b for b in backends if isinstance(b, SQLiteBackend)]
     if sqlite_backends:
-        alert_file = str(Path(sqlite_backends[0]._conn.execute(
-            "PRAGMA database_list").fetchone()[2]).parent / 'alerts.log')
+        alert_file = str(Path(sqlite_backends[0].db_path).parent / 'alerts.log')
     else:
         alert_file = str(script_dir / 'alerts.log')
 

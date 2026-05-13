@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    "error",
+    # paho-mqtt 2.x emits a DeprecationWarning on CallbackAPIVersion access
+    # in some Python builds — ignore so the suite stays clean.
+    "ignore::DeprecationWarning",
+]
