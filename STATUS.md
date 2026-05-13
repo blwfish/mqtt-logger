@@ -34,7 +34,7 @@ The live launchd plist runs `--mariadb` only. SQLite is enabled by adding
 | launchd (watcher)   | `com.blw.mqtt-alert-watcher.plist`| Complete |
 | Docker              | `Dockerfile` + `entrypoint.sh`    | Complete |
 | Unit tests          | `tests/*.py`                      | 78 tests |
-| Integration tests   | `tests/integration/`              | 44 tests, 1 skip |
+| Integration tests   | `tests/integration/`              | 61 tests, 1 skip |
 
 ## Features
 
@@ -79,6 +79,56 @@ The live launchd plist runs `--mariadb` only. SQLite is enabled by adding
 | Flood threshold          | 10 msgs / 5 s window, 60 s cooldown    |
 | SQLite commit batch      | 25 rows or 1 s, whichever first        |
 
+## Future Test Coverage
+
+Gaps known but not yet implemented. Tracked here rather than as GitHub
+issues. Tier 1 has been completed; what remains:
+
+### Tier 2 — characterize guarantees we already claim
+
+- [ ] **Concurrent publishers** — 5 publishers fire 100 msgs each in
+      parallel. Verify total row count = 500, no duplicates, broker-order
+      within each publisher preserved.
+- [ ] **SIGKILL data-loss window** — `kill -9` the daemon mid-traffic,
+      count committed vs published. Document the actual loss bound
+      (claim: ≤ COMMIT_EVERY-1 = 24 rows or COMMIT_INTERVAL_SEC = 1 s
+      of SQLite buffer; ≤ 0 for MariaDB which autocommits).
+- [ ] **Daemon vs unreachable broker** — point `--broker` at a port
+      where nothing listens. Define expected behavior: does it exit
+      non-zero with a useful error, or hang on paho's auto-reconnect?
+- [ ] **Daemon vs bad MariaDB credentials** — wrong password / wrong
+      db / wrong host. Should exit non-zero with a useful error before
+      reaching `loop_forever`.
+- [ ] **One-backend-broken startup** — `--db` to a read-only path AND
+      `--mariadb`. The existing skipped test (in
+      `test_daemon_subprocess.py`) documents that the daemon currently
+      refuses to start in this case; revisit whether it should start
+      with only the working backend. Design question masquerading as
+      a test.
+
+### Tier 3 — higher effort, higher reach
+
+- [ ] **Docker image integration** — build `Dockerfile`, run it against
+      the testcontainer broker + MariaDB. Verifies `entrypoint.sh`'s
+      env-var → flag translation and the non-root user + bind-mount
+      permissions actually work end-to-end. Catches Dockerfile rot.
+- [ ] **Sustained load** — 1k msg/s for 30 s. Verify: row count matches
+      publish count, daemon RSS doesn't grow, batched commits keep up,
+      LoopDetector eviction actually fires (its threshold is every
+      1024 records). Cheapest way to surface a memory leak.
+- [ ] **Real `wait_timeout` reconnect** — set MariaDB `wait_timeout=10`,
+      let the daemon's connection idle past it, then send a message.
+      Verifies the `InterfaceError` reconnect fix against the actual
+      production trigger, not a synthetic `_conn.close()`.
+
+### Out of scope
+
+- launchd plist runtime testing — macOS-only, brittle vs. value
+- paho-mqtt internal correctness — auto-reconnect, callback ordering,
+  protocol-level retries are upstream's responsibility
+- The flood-detector's macOS notification UI — argv structure is unit-
+  tested; the notification popup itself can't be asserted on
+
 ## Known Limitations
 
 - Sender extraction only works for JSON payloads with known field names.
@@ -112,7 +162,7 @@ mqtt-logger/
 
 ### 1.2.0 — integration test tier
 
-- New tier of 44 integration tests under `tests/integration/`, gated by
+- New tier of 61 integration tests under `tests/integration/`, gated by
   the `integration` pytest marker. Disposable Mosquitto + MariaDB
   containers via testcontainers-python. Default `pytest` invocation
   still runs only the 78-test unit tier (~0.1 s); `pytest -m integration`

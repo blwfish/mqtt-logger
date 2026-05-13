@@ -557,7 +557,8 @@ class LoopDetector:
             except Exception:
                 pass
 
-        if platform.system() == 'Darwin':
+        if (platform.system() == 'Darwin'
+                and not os.environ.get('MQTT_LOGGER_DISABLE_OSASCRIPT')):
             try:
                 subprocess.Popen([
                     'osascript', '-e', self._OSASCRIPT_TEMPLATE,

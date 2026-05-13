@@ -273,9 +273,9 @@ def spawn_daemon(tmp_path, mosquitto_container, mariadb):
         env = {
             **os.environ,
             "MQTT_LOGGER_MARIADB_PASSWORD": mariadb.password,
-            # MariaDBBackend uses the `logger` user by default; tests run as
-            # the root user the container creates. Override via env so we
-            # don't have to expose another flag.
+            # Suppress macOS notification popups for any test that triggers
+            # the flood detector. Production never sets this.
+            "MQTT_LOGGER_DISABLE_OSASCRIPT": "1",
         }
 
         proc = subprocess.Popen(args, env=env, cwd=str(scratch))
