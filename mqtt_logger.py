@@ -264,8 +264,8 @@ class MariaDBBackend(DatabaseBackend):
     def close(self):
         try:
             self._conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"MariaDB writer close: {exc}")
 
 
 # ─── Query backends ───────────────────────────────────────────────────────────
@@ -342,8 +342,11 @@ class SQLiteQueryBackend(QueryBackend):
         if '+' in topic_pattern or '#' in topic_pattern:
             import re as _re
             compiled = _re.compile(_mqtt_pattern_to_regex(topic_pattern))
+            # create_function replaces any prior 'mqtt_match' on this connection;
+            # safe because this backend is used synchronously only.
+            # topic is NOT NULL per schema, so t is never None here.
             self._conn.create_function(
-                'mqtt_match', 1, lambda t: bool(compiled.match(t or ''))
+                'mqtt_match', 1, lambda t: bool(compiled.match(t))
             )
             return " AND mqtt_match(topic)", []
         return " AND topic = ?", [topic_pattern]
@@ -453,8 +456,8 @@ class MariaDBQueryBackend(QueryBackend):
     def close(self):
         try:
             self._conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"MariaDB reader close: {exc}")
 
 
 # ─── Sender extraction ────────────────────────────────────────────────────────
@@ -579,8 +582,10 @@ class LoopDetector:
                     'osascript', '-e', self._OSASCRIPT_TEMPLATE,
                     '--', msg, 'MQTT Loop Detected',
                 ])
-            except Exception:
-                pass
+            except FileNotFoundError:
+                pass  # osascript not present (non-macOS or stripped install)
+            except OSError as exc:
+                logger.warning(f"osascript launch failed: {exc}")
 
 
 # ─── MQTT logger ──────────────────────────────────────────────────────────────
@@ -647,8 +652,6 @@ class MQTTLogger:
         try:
             self.client.connect(self.broker, self.port, keepalive=60)
             self.client.loop_forever()
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
         except Exception as e:
             logger.error(f"Connection error: {e}")
         finally:

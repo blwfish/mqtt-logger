@@ -41,7 +41,9 @@ class TestParseDuration:
         ("30m", timedelta(minutes=30)),
         ("2h", timedelta(hours=2)),
         ("7d", timedelta(days=7)),
-        ("1H", timedelta(hours=1)),  # uppercase unit accepted
+        ("1H", timedelta(hours=1)),
+        ("30M", timedelta(minutes=30)),  # uppercase M
+        ("7D", timedelta(days=7)),       # uppercase D
     ])
     def test_units(self, text, delta):
         assert parse_duration(text) == delta
@@ -97,6 +99,23 @@ class TestMqttPatternToRegex:
     def test_hash_must_be_terminal(self):
         with pytest.raises(ValueError):
             mqtt_pattern_to_regex("cova/#/foo")
+
+    def test_bare_hash_matches_any_topic(self):
+        """A bare '#' subscription matches any non-empty topic at any depth."""
+        import re
+        rx = re.compile(mqtt_pattern_to_regex("#"))
+        assert rx.match("single")
+        assert rx.match("a/b")
+        assert rx.match("a/b/c/d")
+        assert not rx.match("")  # empty topic is not a valid MQTT topic
+
+    def test_single_level_no_slash(self):
+        """A plain topic with no wildcards generates an anchored exact-match regex."""
+        import re
+        rx = re.compile(mqtt_pattern_to_regex("sensors"))
+        assert rx.match("sensors")
+        assert not rx.match("sensors/temp")
+        assert not rx.match("xsensors")
 
 
 class TestPayloadTruncation:
@@ -172,9 +191,8 @@ class TestStats:
     def test_show_stats(self, seeded_backend, capsys):
         show_stats(seeded_backend)
         out = capsys.readouterr().out
-        assert "Total events:" in out
-        assert "5" in out
-        assert "Retained msgs:" in out
+        assert "Total events:    5" in out   # exact count, not just any "5"
+        assert "Retained msgs:   1" in out   # one retained row in seeded data
 
 
 class TestListTopics:
