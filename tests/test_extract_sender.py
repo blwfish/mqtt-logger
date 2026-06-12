@@ -71,3 +71,11 @@ class TestEdgeCases:
 
     def test_empty_topic(self):
         assert extract_sender("", "") is None
+
+    def test_trailing_slash_log_topic_returns_none(self):
+        """log/ strips to a single segment — no board to extract."""
+        assert extract_sender("log/", "") is None
+
+    def test_trailing_slash_config_status_transparent(self):
+        """Trailing slash after board name is normalized away by strip('/')."""
+        assert extract_sender("mr/config/status/board1/", "") == "board1"

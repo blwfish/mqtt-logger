@@ -55,7 +55,16 @@ class TestQueryBackendInterface:
         SQLiteBackend(db).close()
         b = SQLiteQueryBackend(db)
         try:
-            assert isinstance(b, QueryBackend)
+            # Construction itself raises TypeError if any abstract method is
+            # unimplemented — no need to assert isinstance separately. Instead,
+            # call every abstract method to verify runtime contract, not just
+            # that the class hierarchy is intact.
+            assert list(b.query_events(None, None, 1)) == []
+            assert list(b.list_topics()) == []
+            s = b.stats()
+            assert set(s) >= {"total_events", "unique_topics", "retained_count",
+                              "first_event", "last_event"}
+            assert s["total_events"] == 0
         finally:
             b.close()
 
@@ -65,9 +74,17 @@ class TestQueryBackendInterface:
         from mqtt_logger import MariaDBQueryBackend, QueryBackend
 
         fake_keyring._password = "secret"
-        fake_pymysql.connect = MagicMock(return_value=MagicMock(name="conn"))
+        fake_conn = MagicMock(name="conn")
+        # stats() fetches one row; supply a plausible empty-table result.
+        fake_conn.cursor.return_value.__enter__.return_value \
+            .fetchone.return_value = (0, 0, None, None, None)
+        fake_pymysql.connect = MagicMock(return_value=fake_conn)
         b = MariaDBQueryBackend(host="h", database="db", user="u")
-        assert isinstance(b, QueryBackend)
+        # Construction proves ABC conformance; calling stats() verifies the
+        # contract beyond the signature.
+        s = b.stats()
+        assert set(s) >= {"total_events", "unique_topics", "retained_count",
+                          "first_event", "last_event"}
 
 
 class TestMariaDBQueryFilters:

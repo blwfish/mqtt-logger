@@ -77,6 +77,9 @@ class TestParity:
 
         assert len(rows) == 1
         _ts, topic, sender, payload, qos, retained = rows[0]
+        assert isinstance(_ts, datetime), \
+            f"timestamp must be datetime on both backends, got {type(_ts)}"
+        assert _ts == datetime(2026, 5, 12, 9, 0, 0)
         assert topic == "log/foo"
         assert sender == "foo"
         assert payload == '{"a":1}'
@@ -102,7 +105,8 @@ class TestParity:
     def test_wildcard_hash_multi_level(self, writer_and_reader):
         writer, reader_factory = writer_and_reader
         now = datetime(2026, 5, 12, 9, 0, 0)
-        for topic in ("cova/a", "cova/a/b", "cova/a/b/c", "other/x"):
+        # "cova" is the bare parent — MQTT spec §4.7.1.2 requires cova/# to match it.
+        for topic in ("cova", "cova/a", "cova/a/b", "cova/a/b/c", "other/x"):
             writer.insert(now, topic, None, "p", 0, 0)
         writer.close()
 
@@ -113,7 +117,7 @@ class TestParity:
             reader.close()
 
         topics = {r[1] for r in rows}
-        assert topics == {"cova/a", "cova/a/b", "cova/a/b/c"}
+        assert topics == {"cova", "cova/a", "cova/a/b", "cova/a/b/c"}
 
     def test_literal_topic(self, writer_and_reader):
         writer, reader_factory = writer_and_reader
@@ -175,6 +179,60 @@ class TestParity:
         assert s["total_events"] == 3
         assert s["unique_topics"] == 2
         assert s["retained_count"] == 2
+        assert isinstance(s["first_event"], datetime), \
+            f"first_event must be datetime on both backends, got {type(s['first_event'])}"
+        assert isinstance(s["last_event"], datetime), \
+            f"last_event must be datetime on both backends, got {type(s['last_event'])}"
+        assert s["first_event"] == datetime(2026, 5, 12, 9, 0, 0)
+        assert s["last_event"] == datetime(2026, 5, 12, 9, 2, 0)
+
+    def test_stats_zero_retained(self, writer_and_reader):
+        """retained_count must be 0, not None, when no rows have retained=1."""
+        writer, reader_factory = writer_and_reader
+        writer.insert(datetime(2026, 5, 12, 9, 0, 0), "a", None, "1", 0, 0)
+        writer.insert(datetime(2026, 5, 12, 9, 1, 0), "b", None, "2", 0, 0)
+        writer.close()
+
+        reader = reader_factory()
+        try:
+            s = reader.stats()
+        finally:
+            reader.close()
+        assert s["retained_count"] == 0
+
+    def test_stats_empty_table(self, writer_and_reader):
+        """stats() on an empty table must return zeros/None without crashing."""
+        writer, reader_factory = writer_and_reader
+        writer.close()
+
+        reader = reader_factory()
+        try:
+            s = reader.stats()
+        finally:
+            reader.close()
+        assert s["total_events"] == 0
+        assert s["unique_topics"] == 0
+        assert s["retained_count"] == 0
+        assert s["first_event"] is None
+        assert s["last_event"] is None
+
+    def test_list_topics(self, writer_and_reader):
+        """Both backends must return the same (topic, count) pairs."""
+        writer, reader_factory = writer_and_reader
+        now = datetime(2026, 5, 12, 9, 0, 0)
+        writer.insert(now, "a/topic", None, "1", 0, 0)
+        writer.insert(now, "a/topic", None, "2", 0, 0)
+        writer.insert(now, "b/topic", None, "3", 0, 0)
+        writer.close()
+
+        reader = reader_factory()
+        try:
+            rows = list(reader.list_topics())
+        finally:
+            reader.close()
+
+        # Expect descending order by count.
+        assert rows == [("a/topic", 2), ("b/topic", 1)]
 
     def test_null_sender_and_payload(self, writer_and_reader):
         writer, reader_factory = writer_and_reader

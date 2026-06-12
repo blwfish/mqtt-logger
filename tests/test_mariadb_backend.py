@@ -146,6 +146,22 @@ class TestRetry:
         assert new_cursor.execute.call_count == 1
         assert backend._conn is new_conn
 
+    @pytest.mark.parametrize("code", [2006, 2013, 2055])
+    def test_all_retryable_codes_trigger_reconnect(self, code, fake_pymysql,
+                                                   fake_keyring, monkeypatch):
+        """Each code in _RETRYABLE must individually trigger reconnect+retry."""
+        backend, fake_conn = make_backend(fake_pymysql, fake_keyring,
+                                          monkeypatch)
+        first_cursor = fake_conn.cursor.return_value.__enter__.return_value
+        first_cursor.execute.side_effect = fake_pymysql.OperationalError(code,
+                                                                          "transient")
+        new_conn = MagicMock(name="new_conn")
+        fake_pymysql.connect = MagicMock(side_effect=[new_conn])
+
+        backend.insert(datetime.now(), "t", None, "p", 0, 0)
+        assert backend._conn is new_conn, \
+            f"OperationalError({code}) should have triggered reconnect"
+
     def test_retry_failure_propagates(self, fake_pymysql, fake_keyring,
                                       monkeypatch):
         """Regression: if reconnect-then-retry also fails, the exception

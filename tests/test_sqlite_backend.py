@@ -92,6 +92,18 @@ class TestBatchedCommits:
         ).fetchone()[0]
         assert count_after == SQLiteBackend.COMMIT_EVERY
 
+    def test_commits_after_size_threshold_plus_one(self, backend, fake_monotonic):
+        """COMMIT_EVERY+1 inserts must still commit at the boundary — pins
+        that the trigger is >= not >, and that pending resets after commit."""
+        for _ in range(SQLiteBackend.COMMIT_EVERY + 1):
+            backend.insert(datetime.now(), "t", None, "p", 0, 0)
+        peek = sqlite3.connect(backend.db_path)
+        count = peek.execute(
+            "SELECT COUNT(*) FROM mqtt_events"
+        ).fetchone()[0]
+        # Commit fired at row COMMIT_EVERY; the +1 row is still pending.
+        assert count == SQLiteBackend.COMMIT_EVERY
+
     def test_commits_after_time_interval(self, tmp_path, fake_monotonic):
         # Construct backend AFTER the monotonic patch so _last_commit captures
         # the fake clock, not the real one.

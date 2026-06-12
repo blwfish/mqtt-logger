@@ -41,10 +41,19 @@ class TestParseDuration:
         ("30m", timedelta(minutes=30)),
         ("2h", timedelta(hours=2)),
         ("7d", timedelta(days=7)),
-        ("1H", timedelta(hours=1)),  # uppercase unit accepted
+        ("1H", timedelta(hours=1)),
+        ("30M", timedelta(minutes=30)),  # uppercase M
+        ("7D", timedelta(days=7)),       # uppercase D
     ])
     def test_units(self, text, delta):
         assert parse_duration(text) == delta
+
+    def test_zero_value_returns_zero_timedelta(self):
+        """parse_duration("0m") must return timedelta(0) — pins the zero-value
+        contract so callers know they'll get an identity cutoff, not an error."""
+        assert parse_duration("0m") == timedelta(0)
+        assert parse_duration("0h") == timedelta(0)
+        assert parse_duration("0d") == timedelta(0)
 
     def test_unknown_unit_raises(self):
         with pytest.raises(ValueError):
@@ -72,7 +81,8 @@ class TestMqttPatternToRegex:
         rx = re.compile(mqtt_pattern_to_regex("cova/#"))
         assert rx.match("cova/foo")
         assert rx.match("cova/foo/bar/baz")
-        assert not rx.match("cova")  # `#` requires at least one segment below
+        assert rx.match("cova")          # MQTT spec §4.7.1.2: # matches the parent too
+        assert not rx.match("other/foo")  # different prefix must not match
 
     def test_literal_topic(self):
         import re
@@ -89,6 +99,57 @@ class TestMqttPatternToRegex:
     def test_hash_must_be_terminal(self):
         with pytest.raises(ValueError):
             mqtt_pattern_to_regex("cova/#/foo")
+
+    def test_bare_hash_matches_any_topic(self):
+        """A bare '#' subscription matches any non-empty topic at any depth."""
+        import re
+        rx = re.compile(mqtt_pattern_to_regex("#"))
+        assert rx.match("single")
+        assert rx.match("a/b")
+        assert rx.match("a/b/c/d")
+        assert not rx.match("")  # empty topic is not a valid MQTT topic
+
+    def test_single_level_no_slash(self):
+        """A plain topic with no wildcards generates an anchored exact-match regex."""
+        import re
+        rx = re.compile(mqtt_pattern_to_regex("sensors"))
+        assert rx.match("sensors")
+        assert not rx.match("sensors/temp")
+        assert not rx.match("xsensors")
+
+
+class TestPayloadTruncation:
+    """Pins the truncation boundary in query_events() at len > 80 characters."""
+
+    def _backend_with_payload(self, tmp_path, payload):
+        from mqtt_logger import SQLiteBackend
+        db_path = tmp_path / "trunc.db"
+        writer = SQLiteBackend(str(db_path))
+        writer.insert(datetime(2026, 5, 12, 10, 0, 0), "t", None, payload, 0, 0)
+        writer.close()
+        return SQLiteQueryBackend(str(db_path))
+
+    def test_payload_at_80_chars_not_truncated(self, tmp_path, capsys):
+        payload = "x" * 80
+        backend = self._backend_with_payload(tmp_path, payload)
+        try:
+            query_events(backend)
+        finally:
+            backend.close()
+        out = capsys.readouterr().out
+        assert "..." not in out
+        assert payload in out
+
+    def test_payload_at_81_chars_is_truncated(self, tmp_path, capsys):
+        payload = "x" * 81
+        backend = self._backend_with_payload(tmp_path, payload)
+        try:
+            query_events(backend)
+        finally:
+            backend.close()
+        out = capsys.readouterr().out
+        assert "..." in out
+        assert payload not in out  # full payload must not appear
 
 
 class TestQueryEvents:
@@ -130,9 +191,8 @@ class TestStats:
     def test_show_stats(self, seeded_backend, capsys):
         show_stats(seeded_backend)
         out = capsys.readouterr().out
-        assert "Total events:" in out
-        assert "5" in out
-        assert "Retained msgs:" in out
+        assert "Total events:    5" in out   # exact count, not just any "5"
+        assert "Retained msgs:   1" in out   # one retained row in seeded data
 
 
 class TestListTopics:
