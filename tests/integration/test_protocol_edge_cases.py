@@ -91,7 +91,7 @@ class TestRetainedMessages:
                 "WHERE topic = 'retained/canary'"
             )
             rows = cur.fetchall()
-        assert rows == (("retained/canary", 1),)
+        assert rows == [("retained/canary", 1)]
 
     def test_restart_delivers_retained_message_again(self, spawn_daemon,
                                                      mosquitto_container,
@@ -143,9 +143,9 @@ class TestSizeLimits:
     constraints. Topic length and payload size cap out at very different
     scales; each can break the daemon in its own way."""
 
-    def test_topic_at_varchar_512_limit(self, spawn_daemon,
-                                         mosquitto_container, mariadb):
-        """A topic just under VARCHAR(512) must succeed end-to-end."""
+    def test_long_topic_lands(self, spawn_daemon, mosquitto_container, mariadb):
+        """A 502-char topic must succeed end-to-end (topic column is TEXT,
+        which accepts topics of any length within the MQTT spec limit)."""
         daemon = spawn_daemon()
         daemon.wait_for_connected()
 
@@ -161,33 +161,25 @@ class TestSizeLimits:
                         (topic,))
             assert cur.fetchone() is not None
 
-    def test_topic_exceeding_varchar_512_does_not_crash_daemon(
-            self, spawn_daemon, mosquitto_container, mariadb):
-        """A topic that exceeds VARCHAR(512) is illegal for MariaDB —
-        INSERT will fail. The daemon's per-backend try/except should
-        absorb the error so subsequent messages still land."""
+    def test_very_long_topic_lands(self, spawn_daemon, mosquitto_container,
+                                   mariadb):
+        """A 602-char topic must also land — the topic column is TEXT, not
+        VARCHAR(512), so there is no MariaDB-side truncation limit."""
         daemon = spawn_daemon()
         daemon.wait_for_connected()
 
-        oversized = "x/" + "y" * 600  # 602 chars, exceeds VARCHAR(512)
+        long_topic = "x/" + "y" * 600  # 602 chars
         _publish(mosquitto_container.host, mosquitto_container.port,
-                 oversized, b"payload")
-        time.sleep(0.3)
-
-        # Now publish a normal message — it must still land.
-        _publish(mosquitto_container.host, mosquitto_container.port,
-                 "after/oversized", b"ok")
+                 long_topic, b"payload")
         time.sleep(0.5)
 
         daemon.process.send_signal(signal.SIGTERM)
         rc = daemon.terminate()
-        assert rc == 0, "daemon should survive an oversized-topic INSERT"
+        assert rc == 0, "daemon should survive a very long topic"
 
         topics = _all_topics(mariadb)
-        assert "after/oversized" in topics, \
-            "daemon dropped a valid message after an oversized one"
-        # The oversized topic itself must not have landed.
-        assert not any(t.startswith("x/yyy") for t in topics)
+        assert any(t.startswith("x/") for t in topics), \
+            "602-char topic did not land (expected TEXT column to accept it)"
 
     def test_one_megabyte_payload(self, spawn_daemon, mosquitto_container,
                                   mariadb):

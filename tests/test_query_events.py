@@ -46,6 +46,13 @@ class TestParseDuration:
     def test_units(self, text, delta):
         assert parse_duration(text) == delta
 
+    def test_zero_value_returns_zero_timedelta(self):
+        """parse_duration("0m") must return timedelta(0) — pins the zero-value
+        contract so callers know they'll get an identity cutoff, not an error."""
+        assert parse_duration("0m") == timedelta(0)
+        assert parse_duration("0h") == timedelta(0)
+        assert parse_duration("0d") == timedelta(0)
+
     def test_unknown_unit_raises(self):
         with pytest.raises(ValueError):
             parse_duration("5x")
@@ -72,7 +79,8 @@ class TestMqttPatternToRegex:
         rx = re.compile(mqtt_pattern_to_regex("cova/#"))
         assert rx.match("cova/foo")
         assert rx.match("cova/foo/bar/baz")
-        assert not rx.match("cova")  # `#` requires at least one segment below
+        assert rx.match("cova")          # MQTT spec §4.7.1.2: # matches the parent too
+        assert not rx.match("other/foo")  # different prefix must not match
 
     def test_literal_topic(self):
         import re
@@ -89,6 +97,40 @@ class TestMqttPatternToRegex:
     def test_hash_must_be_terminal(self):
         with pytest.raises(ValueError):
             mqtt_pattern_to_regex("cova/#/foo")
+
+
+class TestPayloadTruncation:
+    """Pins the truncation boundary in query_events() at len > 80 characters."""
+
+    def _backend_with_payload(self, tmp_path, payload):
+        from mqtt_logger import SQLiteBackend
+        db_path = tmp_path / "trunc.db"
+        writer = SQLiteBackend(str(db_path))
+        writer.insert(datetime(2026, 5, 12, 10, 0, 0), "t", None, payload, 0, 0)
+        writer.close()
+        return SQLiteQueryBackend(str(db_path))
+
+    def test_payload_at_80_chars_not_truncated(self, tmp_path, capsys):
+        payload = "x" * 80
+        backend = self._backend_with_payload(tmp_path, payload)
+        try:
+            query_events(backend)
+        finally:
+            backend.close()
+        out = capsys.readouterr().out
+        assert "..." not in out
+        assert payload in out
+
+    def test_payload_at_81_chars_is_truncated(self, tmp_path, capsys):
+        payload = "x" * 81
+        backend = self._backend_with_payload(tmp_path, payload)
+        try:
+            query_events(backend)
+        finally:
+            backend.close()
+        out = capsys.readouterr().out
+        assert "..." in out
+        assert payload not in out  # full payload must not appear
 
 
 class TestQueryEvents:

@@ -171,8 +171,8 @@ class MariaDBBackend(DatabaseBackend):
         '''CREATE TABLE IF NOT EXISTS mqtt_events (
             id        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
             timestamp DATETIME(6)     NOT NULL,
-            topic     VARCHAR(512)    NOT NULL,
-            sender    VARCHAR(255)    DEFAULT NULL,
+            topic     TEXT            NOT NULL,
+            sender    TEXT            DEFAULT NULL,
             payload   LONGTEXT        DEFAULT NULL,
             qos       TINYINT         NOT NULL,
             retained  TINYINT         NOT NULL,
@@ -297,10 +297,13 @@ class QueryBackend(ABC):
 def _mqtt_pattern_to_regex(pattern: str) -> str:
     """Translate an MQTT topic filter to an anchored regular expression.
 
-    `+` matches exactly one level (no `/`); `#` matches one or more levels
-    and is only legal as the final segment. Both backends use the same
-    translation — SQLite executes it via a Python UDF, MariaDB via REGEXP.
+    `+` matches exactly one level (no `/`); `#` matches the parent topic and
+    any number of sub-levels (MQTT spec §4.7.1.2 — `sport/#` matches `sport`
+    itself as well as `sport/tennis`, `sport/tennis/player1`, etc.).
+    Both backends use the same translation — SQLite via a Python UDF, MariaDB
+    via REGEXP.
     """
+    import re as _re
     segments = pattern.split('/')
     parts = []
     for i, seg in enumerate(segments):
@@ -312,9 +315,13 @@ def _mqtt_pattern_to_regex(pattern: str) -> str:
                     f"'#' is only allowed as the final segment of an MQTT filter "
                     f"(got: {pattern!r})"
                 )
-            parts.append(r'.+')
+            if parts:
+                # e.g. "cova/#" → matches "cova", "cova/a", "cova/a/b/c"
+                return '^' + '/'.join(parts) + r'(?:/.+)?$'
+            else:
+                # bare "#" → matches any non-empty topic
+                return r'^.+$'
         else:
-            import re as _re
             parts.append(_re.escape(seg))
     return '^' + '/'.join(parts) + '$'
 
@@ -353,7 +360,8 @@ class SQLiteQueryBackend(QueryBackend):
             params.append(since.isoformat())
         sql += ' ORDER BY timestamp DESC LIMIT ?'
         params.append(limit)
-        return self._conn.execute(sql, params)
+        for ts_str, topic, sender, payload, qos, retained in self._conn.execute(sql, params):
+            yield (datetime.fromisoformat(ts_str), topic, sender, payload, qos, retained)
 
     def list_topics(self):
         return self._conn.execute(
@@ -362,13 +370,20 @@ class SQLiteQueryBackend(QueryBackend):
         )
 
     def stats(self) -> dict:
-        c = self._conn
+        total, unique, retained, first, last = self._conn.execute(
+            'SELECT COUNT(*), COUNT(DISTINCT topic), SUM(retained), '
+            'MIN(timestamp), MAX(timestamp) FROM mqtt_events'
+        ).fetchone()
+
+        def _ts(s):
+            return datetime.fromisoformat(s) if s else None
+
         return {
-            'total_events':   c.execute('SELECT COUNT(*) FROM mqtt_events').fetchone()[0],
-            'unique_topics':  c.execute('SELECT COUNT(DISTINCT topic) FROM mqtt_events').fetchone()[0],
-            'retained_count': c.execute('SELECT COUNT(*) FROM mqtt_events WHERE retained=1').fetchone()[0],
-            'first_event':    c.execute('SELECT MIN(timestamp) FROM mqtt_events').fetchone()[0],
-            'last_event':     c.execute('SELECT MAX(timestamp) FROM mqtt_events').fetchone()[0],
+            'total_events':   total or 0,
+            'unique_topics':  unique or 0,
+            'retained_count': retained or 0,
+            'first_event':    _ts(first),
+            'last_event':     _ts(last),
         }
 
     def close(self):
@@ -554,8 +569,8 @@ class LoopDetector:
             try:
                 with open(self._alert_file, 'a') as f:
                     f.write(f"{datetime.now().isoformat()} {msg}\n")
-            except Exception:
-                pass
+            except OSError as exc:
+                logger.warning(f"Could not write alert file {self._alert_file!r}: {exc}")
 
         if (platform.system() == 'Darwin'
                 and not os.environ.get('MQTT_LOGGER_DISABLE_OSASCRIPT')):
@@ -603,6 +618,9 @@ class MQTTLogger:
             except UnicodeDecodeError:
                 payload = msg.payload.hex()
 
+            # Use wall-clock time rather than msg.timestamp (paho float) for consistency.
+            # msg.mid / msg.dup are always 0/False at QoS=0 (our subscription level); not stored.
+            # msg.properties (MQTT v5) — deployment is v3.1.1; not stored.
             timestamp = datetime.now()
             sender    = extract_sender(msg.topic, payload)
             retained  = 1 if msg.retain else 0
